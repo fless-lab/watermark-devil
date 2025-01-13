@@ -8,6 +8,9 @@ use tracing::{info, debug, warn};
 use crate::types::{Detection, WatermarkType, Confidence};
 use crate::config::DetectionConfig;
 
+mod bindings;
+use bindings::{LogoDetectorWrapper, TextDetectorWrapper, PatternDetectorWrapper, TransparencyDetectorWrapper};
+
 /// Interface for all watermark detectors
 pub trait WatermarkDetector: Send + Sync {
     fn detect(&self, image: &Mat) -> Result<Vec<Detection>>;
@@ -15,7 +18,7 @@ pub trait WatermarkDetector: Send + Sync {
     fn get_name(&self) -> String;
 }
 
-/// Logo detector using deep learning
+/// Logo detector using YOLOv5 via Python-Rust integration
 pub struct LogoDetector {
     config: DetectionConfig,
     model: Arc<PyObject>,
@@ -46,34 +49,51 @@ impl WatermarkDetector for LogoDetector {
             let numpy = PyModule::import(py, "numpy")?;
             let image_array = numpy.getattr("array")?.call1((image.data()?,))?;
             
-            // Call Python model
-            let detections = self.model.call_method1(py, "detect", (image_array,))?;
+            // Prétraitement de l'image
+            let preprocessed = self.model.call_method1(py, "preprocess", (image_array,))?;
             
-            // Convert Python results to Rust structs
-            let mut results = Vec::new();
-            for detection in detections.iter(py)? {
-                let det = detection?;
-                let bbox = det.getattr("bbox")?.extract::<(i32, i32, i32, i32)>()?;
-                let confidence = det.getattr("confidence")?.extract::<f32>()?;
+            // Détection avec le modèle
+            let predictions = self.model.call_method1(py, "detect", (preprocessed,))?;
+            
+            // Convertir les prédictions en détections
+            let mut detections = Vec::new();
+            
+            for pred in predictions.iter()? {
+                let pred = pred?;
+                let bbox = pred.get_item(0)?;
+                let confidence = pred.get_item(1)?.extract::<f32>()?;
                 
-                results.push(Detection {
-                    watermark_type: WatermarkType::Logo,
+                // Créer le rectangle de détection
+                let rect = Rect::new(
+                    bbox.get_item(0)?.extract()?,
+                    bbox.get_item(1)?.extract()?,
+                    bbox.get_item(2)?.extract()?,
+                    bbox.get_item(3)?.extract()?,
+                );
+                
+                // Ajouter la détection
+                detections.push(Detection {
+                    watermark_type: self.get_type(),
+                    bbox: rect,
                     confidence: Confidence::new(confidence),
-                    bbox: Rect::new(bbox.0, bbox.1, bbox.2, bbox.3),
-                    metadata: None,
+                    mask: None,  // Le masque sera généré si nécessaire
+                    metadata: Some(serde_json::json!({
+                        "model": "yolov5",
+                        "size": format!("{}x{}", rect.width, rect.height),
+                    })),
                 });
             }
             
-            Ok(results)
+            Ok(detections)
         })
     }
-    
+
     fn get_type(&self) -> WatermarkType {
         WatermarkType::Logo
     }
-    
+
     fn get_name(&self) -> String {
-        "LogoDetector".to_string()
+        "YOLOv5 Logo Detector".to_string()
     }
 }
 
@@ -262,64 +282,63 @@ impl WatermarkDetector for TransparencyDetector {
 
 /// Ensemble detector that combines results from multiple detectors
 pub struct EnsembleDetector {
-    detectors: Vec<Box<dyn WatermarkDetector>>,
     config: DetectionConfig,
+    logo_detector: LogoDetectorWrapper,
+    text_detector: TextDetectorWrapper,
+    pattern_detector: PatternDetectorWrapper,
+    transparency_detector: TransparencyDetectorWrapper,
 }
 
 impl EnsembleDetector {
     pub fn new(config: &DetectionConfig) -> Result<Self> {
-        let mut detectors: Vec<Box<dyn WatermarkDetector>> = Vec::new();
-        
-        // Initialize all detectors
-        detectors.push(Box::new(LogoDetector::new(config)?));
-        detectors.push(Box::new(TextDetector::new(config)?));
-        detectors.push(Box::new(PatternDetector::new(config)?));
-        detectors.push(Box::new(TransparencyDetector::new(config)?));
-        
         Ok(Self {
-            detectors,
+            logo_detector: LogoDetectorWrapper::new(config)?,
+            text_detector: TextDetectorWrapper::new(config)?,
+            pattern_detector: PatternDetectorWrapper::new(config)?,
+            transparency_detector: TransparencyDetectorWrapper::new(config)?,
             config: config.clone(),
         })
     }
     
     pub fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
-        // Run all detectors in parallel
-        let all_detections: Vec<Vec<Detection>> = self.detectors.par_iter()
-            .map(|detector| {
-                match detector.detect(image) {
-                    Ok(detections) => detections,
-                    Err(e) => {
-                        warn!("Detector {} failed: {}", detector.get_name(), e);
-                        Vec::new()
-                    }
-                }
-            })
-            .collect();
+        let mut all_detections = Vec::new();
         
-        // Merge and filter detections
-        let mut merged = Vec::new();
-        for detections in all_detections {
-            for detection in detections {
-                if detection.confidence.value > self.config.min_confidence {
-                    merged.push(detection);
-                }
-            }
+        // Détecter avec chaque détecteur
+        if let Ok(detections) = self.logo_detector.detect(image) {
+            all_detections.extend(detections);
+        }
+        
+        if let Ok(detections) = self.text_detector.detect(image) {
+            all_detections.extend(detections);
+        }
+        
+        if let Ok(detections) = self.pattern_detector.detect(image) {
+            all_detections.extend(detections);
+        }
+        
+        if let Ok(detections) = self.transparency_detector.detect(image) {
+            all_detections.extend(detections);
         }
         
         // Non-maximum suppression
-        self.non_max_suppression(&mut merged);
+        self.non_max_suppression(&mut all_detections);
         
-        Ok(merged)
+        Ok(all_detections)
     }
     
     fn non_max_suppression(&self, detections: &mut Vec<Detection>) {
-        detections.sort_by(|a, b| b.confidence.value.partial_cmp(&a.confidence.value).unwrap());
+        if detections.is_empty() {
+            return;
+        }
+        
+        // Trier par confiance
+        detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         
         let mut i = 0;
         while i < detections.len() {
             let mut j = i + 1;
             while j < detections.len() {
-                if self.iou(&detections[i].bbox, &detections[j].bbox) > self.config.nms_threshold {
+                if self.iou(&detections[i].bbox, &detections[j].bbox) > self.config.iou_threshold {
                     detections.remove(j);
                 } else {
                     j += 1;
@@ -330,16 +349,19 @@ impl EnsembleDetector {
     }
     
     fn iou(&self, bbox1: &Rect, bbox2: &Rect) -> f32 {
-        let intersection = bbox1 & bbox2;
-        if intersection.width <= 0 || intersection.height <= 0 {
+        let x1 = bbox1.x.max(bbox2.x);
+        let y1 = bbox1.y.max(bbox2.y);
+        let x2 = (bbox1.x + bbox1.width).min(bbox2.x + bbox2.width);
+        let y2 = (bbox1.y + bbox1.height).min(bbox2.y + bbox2.height);
+        
+        if x2 < x1 || y2 < y1 {
             return 0.0;
         }
         
-        let intersection_area = intersection.width * intersection.height;
-        let union_area = (bbox1.width * bbox1.height) + 
-                        (bbox2.width * bbox2.height) - 
-                        intersection_area;
+        let intersection = (x2 - x1) * (y2 - y1);
+        let area1 = bbox1.width * bbox1.height;
+        let area2 = bbox2.width * bbox2.height;
         
-        intersection_area as f32 / union_area as f32
+        intersection as f32 / (area1 + area2 - intersection) as f32
     }
 }
