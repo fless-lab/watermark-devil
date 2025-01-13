@@ -1,111 +1,168 @@
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use dotenv::dotenv;
 use anyhow::Result;
 
+/// Configuration principale du moteur de traitement
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
-    pub processing: ProcessingConfig,
+    /// Configuration de la détection
     pub detection: DetectionConfig,
+    /// Configuration de la reconstruction
     pub reconstruction: ReconstructionConfig,
+    /// Configuration de l'optimisation
+    pub optimization: OptimizationConfig,
+    /// Configuration du système d'apprentissage
     pub learning: LearningConfig,
-    pub storage: StorageConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VideoConfig {
-    pub use_gpu: bool,
-    pub batch_size: usize,
-    pub temporal_window_size: usize,
-    pub quality: i32,
-    pub hardware_acceleration: bool,
-    pub streaming_mode: bool,
-    pub buffer_size: usize,
-}
-
-impl Default for VideoConfig {
-    fn default() -> Self {
-        Self {
-            use_gpu: true,
-            batch_size: 16,
-            temporal_window_size: 5,
-            quality: 28,
-            hardware_acceleration: true,
-            streaming_mode: false,
-            buffer_size: 3,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessingConfig {
-    pub gpu_enabled: bool,
-    pub cuda_devices: Vec<i32>,
+    /// Active ou désactive le système d'apprentissage
+    pub learning_enabled: bool,
+    /// Nombre maximum de threads pour le traitement parallèle
+    pub max_threads: usize,
+    /// Taille maximale de batch pour le traitement par lots
     pub max_batch_size: usize,
-    pub processing_timeout: u64,
-    pub default_image_size: u32,
-    pub preserve_exif: bool,
-    pub output_quality: u8,
-    pub video: VideoConfig,
+    /// Répertoire pour les fichiers temporaires
+    pub temp_dir: PathBuf,
 }
 
-impl Default for ProcessingConfig {
+impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            gpu_enabled: true,
-            cuda_devices: vec![0],
-            max_batch_size: 16,
-            processing_timeout: 300,
-            default_image_size: 1024,
-            preserve_exif: false,
-            output_quality: 95,
-            video: VideoConfig::default(),
+            detection: DetectionConfig::default(),
+            reconstruction: ReconstructionConfig::default(),
+            optimization: OptimizationConfig::default(),
+            learning: LearningConfig::default(),
+            learning_enabled: true,
+            max_threads: num_cpus::get(),
+            max_batch_size: 32,
+            temp_dir: std::env::temp_dir().join("watermark-evil"),
         }
     }
 }
 
+/// Configuration du moteur de détection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
+    /// Seuil de confiance minimum pour les détections
     pub confidence_threshold: f32,
+    /// Seuil IoU pour le NMS
     pub iou_threshold: f32,
-    pub max_detections: usize,
-    pub model_path: PathBuf,
-    pub pattern_db_path: PathBuf,
+    /// Taille maximale d'image en entrée
+    pub max_image_size: (u32, u32),
+    /// Utiliser le GPU si disponible
+    pub use_gpu: bool,
+    /// Modèles à utiliser
+    pub models: Vec<DetectionModel>,
 }
 
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            confidence_threshold: 0.5,
+            iou_threshold: 0.45,
+            max_image_size: (4096, 4096),
+            use_gpu: true,
+            models: vec![
+                DetectionModel::Logo,
+                DetectionModel::Text,
+                DetectionModel::Pattern,
+            ],
+        }
+    }
+}
+
+/// Configuration du moteur de reconstruction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconstructionConfig {
-    pub quality: String,
-    pub method: String,
-    pub model_path: PathBuf,
-    pub temp_files_path: PathBuf,
+    /// Taille des patchs pour la reconstruction
+    pub patch_size: u32,
+    /// Chevauchement des patchs
+    pub overlap: u32,
+    /// Qualité minimale requise
+    pub quality_threshold: f32,
+    /// Utiliser le GPU si disponible
     pub use_gpu: bool,
-    pub preserve_details: bool,
-    pub max_iterations: usize,
-    pub window_size: usize,
-    pub overlap: usize,
+    /// Méthode de reconstruction par défaut
+    pub default_method: ReconstructionMethod,
 }
 
+impl Default for ReconstructionConfig {
+    fn default() -> Self {
+        Self {
+            patch_size: 256,
+            overlap: 32,
+            quality_threshold: 0.8,
+            use_gpu: true,
+            default_method: ReconstructionMethod::Hybrid,
+        }
+    }
+}
+
+/// Configuration de l'optimisation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationConfig {
+    /// Utiliser CUDA si disponible
+    pub use_cuda: bool,
+    /// Utiliser OpenCL si disponible
+    pub use_opencl: bool,
+    /// Utiliser SIMD si disponible
+    pub use_simd: bool,
+    /// Taille du cache en mémoire (en Mo)
+    pub cache_size_mb: usize,
+}
+
+impl Default for OptimizationConfig {
+    fn default() -> Self {
+        Self {
+            use_cuda: true,
+            use_opencl: true,
+            use_simd: true,
+            cache_size_mb: 1024,
+        }
+    }
+}
+
+/// Configuration du système d'apprentissage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearningConfig {
-    pub enabled: bool,
-    pub min_samples_for_training: usize,
-    pub training_interval: u64,
-    pub model_backup_enabled: bool,
-    pub model_backup_path: PathBuf,
-    pub export_metrics: bool,
+    /// Intervalle minimum entre les mises à jour (en secondes)
+    pub update_interval: u64,
+    /// Nombre minimum d'échantillons avant mise à jour
+    pub min_samples: usize,
+    /// Sauvegarder les modèles après chaque mise à jour
+    pub save_models: bool,
+    /// Répertoire pour les sauvegardes de modèles
+    pub models_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageConfig {
-    pub storage_type: String,
-    pub local_path: PathBuf,
-    pub s3_bucket: Option<String>,
-    pub s3_region: Option<String>,
-    pub s3_access_key: Option<String>,
-    pub s3_secret_key: Option<String>,
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            update_interval: 3600,
+            min_samples: 100,
+            save_models: true,
+            models_dir: PathBuf::from("models"),
+        }
+    }
+}
+
+/// Types de modèles de détection disponibles
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum DetectionModel {
+    Logo,
+    Text,
+    Pattern,
+    Transparency,
+}
+
+/// Méthodes de reconstruction disponibles
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ReconstructionMethod {
+    Inpainting,
+    Diffusion,
+    FrequencyDomain,
+    Hybrid,
 }
 
 pub struct ConfigManager {
@@ -123,172 +180,123 @@ impl ConfigManager {
     }
 
     fn load_config() -> Result<EngineConfig> {
-        let processing = ProcessingConfig {
-            gpu_enabled: std::env::var("GPU_ENABLED")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            cuda_devices: std::env::var("CUDA_VISIBLE_DEVICES")
-                .unwrap_or_else(|_| "0".to_string())
-                .split(',')
-                .filter_map(|s| s.parse().ok())
-                .collect(),
-            max_batch_size: std::env::var("MAX_BATCH_SIZE")
-                .unwrap_or_else(|_| "16".to_string())
-                .parse()
-                .unwrap_or(16),
-            processing_timeout: std::env::var("PROCESSING_TIMEOUT")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300),
-            default_image_size: std::env::var("DEFAULT_IMAGE_SIZE")
-                .unwrap_or_else(|_| "1024".to_string())
-                .parse()
-                .unwrap_or(1024),
-            preserve_exif: std::env::var("PRESERVE_EXIF")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
-            output_quality: std::env::var("OUTPUT_QUALITY")
-                .unwrap_or_else(|_| "95".to_string())
-                .parse()
-                .unwrap_or(95),
-            video: VideoConfig {
-                use_gpu: std::env::var("VIDEO_USE_GPU")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .parse()
-                    .unwrap_or(true),
-                batch_size: std::env::var("VIDEO_BATCH_SIZE")
-                    .unwrap_or_else(|_| "16".to_string())
-                    .parse()
-                    .unwrap_or(16),
-                temporal_window_size: std::env::var("VIDEO_TEMPORAL_WINDOW_SIZE")
-                    .unwrap_or_else(|_| "5".to_string())
-                    .parse()
-                    .unwrap_or(5),
-                quality: std::env::var("VIDEO_QUALITY")
-                    .unwrap_or_else(|_| "28".to_string())
-                    .parse()
-                    .unwrap_or(28),
-                hardware_acceleration: std::env::var("VIDEO_HARDWARE_ACCELERATION")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .parse()
-                    .unwrap_or(true),
-                streaming_mode: std::env::var("VIDEO_STREAMING_MODE")
-                    .unwrap_or_else(|_| "false".to_string())
-                    .parse()
-                    .unwrap_or(false),
-                buffer_size: std::env::var("VIDEO_BUFFER_SIZE")
-                    .unwrap_or_else(|_| "3".to_string())
-                    .parse()
-                    .unwrap_or(3),
-            },
-        };
-
         let detection = DetectionConfig {
             confidence_threshold: std::env::var("DETECTION_CONFIDENCE_THRESHOLD")
                 .unwrap_or_else(|_| "0.5".to_string())
                 .parse()
                 .unwrap_or(0.5),
             iou_threshold: std::env::var("DETECTION_IOU_THRESHOLD")
-                .unwrap_or_else(|_| "0.3".to_string())
+                .unwrap_or_else(|_| "0.45".to_string())
                 .parse()
-                .unwrap_or(0.3),
-            max_detections: std::env::var("DETECTION_MAX_DETECTIONS")
-                .unwrap_or_else(|_| "10".to_string())
+                .unwrap_or(0.45),
+            max_image_size: (
+                std::env::var("DETECTION_MAX_IMAGE_SIZE_WIDTH")
+                    .unwrap_or_else(|_| "4096".to_string())
+                    .parse()
+                    .unwrap_or(4096),
+                std::env::var("DETECTION_MAX_IMAGE_SIZE_HEIGHT")
+                    .unwrap_or_else(|_| "4096".to_string())
+                    .parse()
+                    .unwrap_or(4096),
+            ),
+            use_gpu: std::env::var("DETECTION_USE_GPU")
+                .unwrap_or_else(|_| "true".to_string())
                 .parse()
-                .unwrap_or(10),
-            model_path: PathBuf::from(
-                std::env::var("DETECTION_MODEL_PATH")
-                    .unwrap_or_else(|_| "models/detection".to_string())
-            ),
-            pattern_db_path: PathBuf::from(
-                std::env::var("PATTERN_DB_PATH")
-                    .unwrap_or_else(|_| "data/patterns".to_string())
-            ),
+                .unwrap_or(true),
+            models: vec![
+                DetectionModel::Logo,
+                DetectionModel::Text,
+                DetectionModel::Pattern,
+            ],
         };
 
         let reconstruction = ReconstructionConfig {
-            quality: std::env::var("RECONSTRUCTION_QUALITY")
-                .unwrap_or_else(|_| "high".to_string()),
-            method: std::env::var("RECONSTRUCTION_METHOD")
-                .unwrap_or_else(|_| "hybrid".to_string()),
-            model_path: PathBuf::from(
-                std::env::var("RECONSTRUCTION_MODEL_PATH")
-                    .unwrap_or_else(|_| "models/reconstruction".to_string())
-            ),
-            temp_files_path: PathBuf::from(
-                std::env::var("TEMP_FILES_PATH")
-                    .unwrap_or_else(|_| "temp".to_string())
-            ),
-            use_gpu: std::env::var("RECONSTRUCTION_USE_GPU")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            preserve_details: std::env::var("RECONSTRUCTION_PRESERVE_DETAILS")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            max_iterations: std::env::var("RECONSTRUCTION_MAX_ITERATIONS")
-                .unwrap_or_else(|_| "100".to_string())
-                .parse()
-                .unwrap_or(100),
-            window_size: std::env::var("RECONSTRUCTION_WINDOW_SIZE")
+            patch_size: std::env::var("RECONSTRUCTION_PATCH_SIZE")
                 .unwrap_or_else(|_| "256".to_string())
                 .parse()
                 .unwrap_or(256),
             overlap: std::env::var("RECONSTRUCTION_OVERLAP")
-                .unwrap_or_else(|_| "128".to_string())
+                .unwrap_or_else(|_| "32".to_string())
                 .parse()
-                .unwrap_or(128),
+                .unwrap_or(32),
+            quality_threshold: std::env::var("RECONSTRUCTION_QUALITY_THRESHOLD")
+                .unwrap_or_else(|_| "0.8".to_string())
+                .parse()
+                .unwrap_or(0.8),
+            use_gpu: std::env::var("RECONSTRUCTION_USE_GPU")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            default_method: ReconstructionMethod::Hybrid,
+        };
+
+        let optimization = OptimizationConfig {
+            use_cuda: std::env::var("OPTIMIZATION_USE_CUDA")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            use_opencl: std::env::var("OPTIMIZATION_USE_OPENCL")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            use_simd: std::env::var("OPTIMIZATION_USE_SIMD")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            cache_size_mb: std::env::var("OPTIMIZATION_CACHE_SIZE_MB")
+                .unwrap_or_else(|_| "1024".to_string())
+                .parse()
+                .unwrap_or(1024),
         };
 
         let learning = LearningConfig {
-            enabled: std::env::var("LEARNING_ENABLED")
+            update_interval: std::env::var("LEARNING_UPDATE_INTERVAL")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .unwrap_or(3600),
+            min_samples: std::env::var("LEARNING_MIN_SAMPLES")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .unwrap_or(100),
+            save_models: std::env::var("LEARNING_SAVE_MODELS")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .unwrap_or(true),
-            min_samples_for_training: std::env::var("MIN_SAMPLES_FOR_TRAINING")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .unwrap_or(1000),
-            training_interval: std::env::var("TRAINING_INTERVAL")
-                .unwrap_or_else(|_| "86400".to_string())
-                .parse()
-                .unwrap_or(86400),
-            model_backup_enabled: std::env::var("MODEL_BACKUP_ENABLED")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
-            model_backup_path: PathBuf::from(
-                std::env::var("MODEL_BACKUP_PATH")
-                    .unwrap_or_else(|_| "backups".to_string())
+            models_dir: PathBuf::from(
+                std::env::var("LEARNING_MODELS_DIR")
+                    .unwrap_or_else(|_| "models".to_string())
             ),
-            export_metrics: std::env::var("EXPORT_METRICS")
-                .unwrap_or_else(|_| "true".to_string())
-                .parse()
-                .unwrap_or(true),
         };
 
-        let storage = StorageConfig {
-            storage_type: std::env::var("STORAGE_TYPE")
-                .unwrap_or_else(|_| "local".to_string()),
-            local_path: PathBuf::from(
-                std::env::var("LOCAL_STORAGE_PATH")
-                    .unwrap_or_else(|_| "storage".to_string())
-            ),
-            s3_bucket: std::env::var("S3_BUCKET").ok(),
-            s3_region: std::env::var("S3_REGION").ok(),
-            s3_access_key: std::env::var("S3_ACCESS_KEY").ok(),
-            s3_secret_key: std::env::var("S3_SECRET_KEY").ok(),
-        };
+        let learning_enabled = std::env::var("LEARNING_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+
+        let max_threads = std::env::var("MAX_THREADS")
+            .unwrap_or_else(|_| num_cpus::get().to_string())
+            .parse()
+            .unwrap_or(num_cpus::get());
+
+        let max_batch_size = std::env::var("MAX_BATCH_SIZE")
+            .unwrap_or_else(|_| "32".to_string())
+            .parse()
+            .unwrap_or(32);
+
+        let temp_dir = PathBuf::from(
+            std::env::var("TEMP_DIR")
+                .unwrap_or_else(|_| std::env::temp_dir().join("watermark-evil").to_str().unwrap().to_string())
+        );
 
         Ok(EngineConfig {
-            processing,
             detection,
             reconstruction,
+            optimization,
             learning,
-            storage,
+            learning_enabled,
+            max_threads,
+            max_batch_size,
+            temp_dir,
         })
     }
 
@@ -330,8 +338,8 @@ mod tests {
         let config = config_manager.get_config().await;
 
         // Verify configuration
-        assert!(config.processing.gpu_enabled);
-        assert_eq!(config.processing.max_batch_size, 32);
-        assert_eq!(config.detection.model_path, model_path);
+        assert!(config.detection.use_gpu);
+        assert_eq!(config.optimization.cache_size_mb, 1024);
+        assert_eq!(config.learning.update_interval, 3600);
     }
 }
