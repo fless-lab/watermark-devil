@@ -51,94 +51,118 @@ impl DiffusionReconstructor {
         })
     }
 
-    pub fn reconstruct(&self, image: &Mat, detection: &Detection) -> Result<ReconstructionResult> {
-        debug!("Starting diffusion-based reconstruction");
-        
-        // Preprocess image
-        let tensor = self.preprocess_image(image)?;
-        
-        // Create conditioning mask
+    pub async fn reconstruct(&self, image: &Mat, detection: &Detection) -> Result<ReconstructionResult> {
+        debug!("Starting diffusion-based reconstruction for detection: {:?}", detection);
+        let start_time = std::time::Instant::now();
+
+        // Prétraitement
+        let original_tensor = self.preprocess_image(image)?;
         let condition_mask = self.create_condition_mask(image, detection)?;
         
-        // Generate initial noise
-        let mut x_t = self.generate_initial_noise(&tensor.size())?;
-        
-        // Denoise process
-        let num_inference_steps = if self.config.quality == "high" {
-            50
-        } else {
-            20
-        };
-        
-        for t in (0..num_inference_steps).rev() {
-            debug!("Denoising step {}/{}", num_inference_steps - t, num_inference_steps);
-            x_t = self.denoise_step(x_t, &tensor, &condition_mask, t)?;
+        // Initialisation du bruit
+        let noise = self.generate_initial_noise(original_tensor.size().as_slice())?;
+        let mut x_t = noise;
+
+        // Processus de débruitage progressif
+        for timestep in (0..self.model.noise_scheduler.num_inference_steps).rev() {
+            debug!("Denoising step {}", timestep);
+            x_t = self.denoise_step(x_t, &original_tensor, &condition_mask, timestep)?;
         }
+
+        // Combinaison avec l'image originale
+        let reconstructed = self.combine_with_original(image, &x_t, &condition_mask)?;
         
-        // Combine result with original image
-        let result = self.combine_with_original(image, &x_t, &condition_mask)?;
+        // Évaluation de la qualité
+        let quality_score = self.calculate_quality(image, &reconstructed, detection)?;
         
-        // Calculate quality score
-        let quality_score = self.calculate_quality(image, &result, detection)?;
-        
+        let processing_time = start_time.elapsed();
+        info!(
+            "Reconstruction completed in {:?} with quality score: {:.2}",
+            processing_time, quality_score
+        );
+
         Ok(ReconstructionResult {
-            image: result,
+            success: true,
             quality_score,
-            method_used: ReconstructionMethod::Diffusion,
-            metadata: Some(serde_json::json!({
-                "num_inference_steps": num_inference_steps,
-                "device": format!("{:?}", self.device),
-                "quality_mode": self.config.quality,
-            })),
+            processing_time,
+            method: ReconstructionMethod::Diffusion,
+            output_image: reconstructed,
         })
     }
 
     fn preprocess_image(&self, image: &Mat) -> Result<Tensor> {
-        let mut resized = Mat::default();
-        imgproc::resize(
-            image,
-            &mut resized,
-            Size::new(512, 512),
-            0.0,
-            0.0,
-            INTER_LINEAR,
-        )?;
+        debug!("Preprocessing image for diffusion");
         
-        let tensor = Tensor::try_from(&resized)?
+        // Convertir en RGB si nécessaire
+        let mut rgb_image = Mat::default();
+        if image.channels()? == 1 {
+            imgproc::cvt_color(image, &mut rgb_image, imgproc::COLOR_GRAY2RGB, 0)?;
+        } else if image.channels()? == 4 {
+            imgproc::cvt_color(image, &mut rgb_image, imgproc::COLOR_BGRA2RGB, 0)?;
+        } else {
+            imgproc::cvt_color(image, &mut rgb_image, imgproc::COLOR_BGR2RGB, 0)?;
+        }
+
+        // Normaliser à [-1, 1]
+        let normalized = unsafe {
+            let mut float_mat = Mat::new_rows_cols(
+                rgb_image.rows()?,
+                rgb_image.cols()?,
+                opencv::core::CV_32FC3,
+            )?;
+            rgb_image.convert_to(&mut float_mat, opencv::core::CV_32F, 1.0/127.5, -1.0)?;
+            float_mat
+        };
+
+        // Convertir en Tensor
+        let tensor = Tensor::try_from(normalized)?
             .to_device(self.device)
-            .to_kind(tch::Kind::Float)
-            .div(255.);
+            .permute(&[2, 0, 1])  // HWC -> CHW
+            .unsqueeze(0);        // Ajouter dimension batch
         
-        // Normalize to [-1, 1]
-        Ok(tensor.sub(0.5).mul(2.0))
+        Ok(tensor)
     }
 
     fn create_condition_mask(&self, image: &Mat, detection: &Detection) -> Result<Tensor> {
-        let mut mask = Mat::new_rows_cols_with_default(
-            image.rows(),
-            image.cols(),
+        debug!("Creating condition mask for detection: {:?}", detection);
+        
+        // Créer un masque binaire
+        let mut mask = Mat::new_rows_cols(
+            image.rows()?,
+            image.cols()?,
             opencv::core::CV_8UC1,
-            opencv::core::Scalar::all(0.0),
         )?;
+        mask.set_scalar(0.into())?;
+
+        // Dessiner la zone de détection
+        let bbox = detection.bbox;
+        let rect = opencv::core::Rect::new(
+            bbox.x,
+            bbox.y,
+            bbox.width,
+            bbox.height,
+        );
         
-        let rect = detection.bbox;
-        imgproc::rectangle(
-            &mut mask,
-            opencv::core::Point::new(rect.x, rect.y),
-            opencv::core::Point::new(rect.x + rect.width, rect.y + rect.height),
-            opencv::core::Scalar::all(255.0),
-            -1,
-            imgproc::LINE_8,
-            0,
+        // Appliquer un flou gaussien aux bords pour transition douce
+        let mut smooth_mask = mask.clone();
+        imgproc::gaussian_blur(
+            &mask,
+            &mut smooth_mask,
+            Size::new(5, 5),
+            1.5,
+            1.5,
+            opencv::core::BORDER_DEFAULT,
         )?;
-        
-        // Convert to tensor
-        let tensor = Tensor::try_from(&mask)?
+
+        // Convertir en Tensor
+        let mask_tensor = Tensor::try_from(smooth_mask)?
             .to_device(self.device)
             .to_kind(tch::Kind::Float)
-            .div(255.);
-        
-        Ok(tensor)
+            .div(255.0)  // Normaliser à [0, 1]
+            .unsqueeze(0)  // Ajouter dimension batch
+            .unsqueeze(0); // Ajouter dimension canal
+
+        Ok(mask_tensor)
     }
 
     fn generate_initial_noise(&self, size: &[i64]) -> Result<Tensor> {
@@ -152,45 +176,93 @@ impl DiffusionReconstructor {
         condition_mask: &Tensor,
         timestep: i64,
     ) -> Result<Tensor> {
+        // Obtenir le niveau de bruit pour ce pas de temps
         let noise_level = self.model.noise_scheduler.get_noise_level(timestep);
         
-        // Predict noise
+        // Prédire le bruit
         let noise_pred = self.model.unet.forward_t(
-            &x_t.cat(&[original.shallow_clone(), condition_mask.shallow_clone()], 1),
-            true,
-        );
+            &x_t,
+            Some(timestep),
+            Some(condition_mask),
+            false
+        )?;
         
-        // Denoise step
-        self.model.noise_scheduler.step(&x_t, &noise_pred, timestep, noise_level)
+        // Débruiter avec le scheduler
+        let denoised = self.model.noise_scheduler.step(
+            &x_t,
+            &noise_pred,
+            timestep,
+            noise_level,
+        )?;
+        
+        // Appliquer le masque de condition
+        let result = denoised.mul(condition_mask) + original.mul(condition_mask.neg() + 1.0);
+        
+        Ok(result)
     }
 
     fn combine_with_original(&self, original: &Mat, generated: &Tensor, mask: &Tensor) -> Result<Mat> {
-        let mut generated_mat = Mat::default();
-        generated.detach().to_device(Device::Cpu).try_into_mat()?.convert_to(&mut generated_mat, opencv::core::CV_8UC3, 1.0, 0.0)?;
+        // Convertir le tensor généré en Mat
+        let mut gen_mat = Mat::default();
+        generated
+            .squeeze()  // Enlever dimension batch
+            .permute(&[1, 2, 0])  // CHW -> HWC
+            .to_device(Device::Cpu)
+            .try_into_mat()?
+            .convert_to(&mut gen_mat, opencv::core::CV_8U, 127.5, 127.5)?;
         
-        let mut result = original.clone();
-        generated_mat.copy_to_masked(&mut result, mask)?;
+        // Convertir le masque en Mat
+        let mut mask_mat = Mat::default();
+        mask
+            .squeeze_all()
+            .to_device(Device::Cpu)
+            .try_into_mat()?
+            .convert_to(&mut mask_mat, opencv::core::CV_8U, 255.0, 0.0)?;
+        
+        // Combiner avec l'image originale
+        let mut result = Mat::default();
+        opencv::core::add_weighted(
+            &gen_mat,
+            1.0,
+            original,
+            1.0,
+            0.0,
+            &mut result,
+            -1,
+        )?;
         
         Ok(result)
     }
 
     fn calculate_quality(&self, original: &Mat, result: &Mat, detection: &Detection) -> Result<f32> {
-        let mut quality = 0.0;
+        // Calculer SSIM uniquement sur la zone reconstruite
+        let bbox = detection.bbox;
+        let rect = opencv::core::Rect::new(
+            bbox.x,
+            bbox.y,
+            bbox.width,
+            bbox.height,
+        );
         
-        // Calculate PSNR in the reconstructed region
-        let roi = Mat::roi(result, detection.bbox)?;
-        let roi_original = Mat::roi(original, detection.bbox)?;
+        let orig_roi = Mat::roi(original, rect)?;
+        let result_roi = Mat::roi(result, rect)?;
         
-        let mse = opencv::core::compare_mse(&roi, &roi_original)?;
-        if mse > 0.0 {
-            quality = 10.0 * (255.0 * 255.0 / mse).log10();
+        // Convertir en niveaux de gris pour SSIM
+        let mut orig_gray = Mat::default();
+        let mut result_gray = Mat::default();
+        imgproc::cvt_color(&orig_roi, &mut orig_gray, imgproc::COLOR_BGR2GRAY, 0)?;
+        imgproc::cvt_color(&result_roi, &mut result_gray, imgproc::COLOR_BGR2GRAY, 0)?;
+        
+        // Calculer SSIM
+        let mut ssim = 0.0;
+        unsafe {
+            opencv::quality::quality_ssim(&orig_gray, &result_gray, None)?
+                .data_typed::<f32>()?
+                .iter()
+                .for_each(|&x| ssim += x);
         }
         
-        // Normalize to [0, 1]
-        quality = quality / 50.0; // Typical PSNR values are between 20-50
-        quality = quality.max(0.0).min(1.0);
-        
-        Ok(quality)
+        Ok(ssim)
     }
 }
 
@@ -449,9 +521,10 @@ mod tests {
         let result = reconstructor.reconstruct(&image, &detection)?;
         
         // Verify result
+        assert!(result.success);
         assert!(result.quality_score > 0.5);
-        assert_eq!(result.method_used, ReconstructionMethod::Diffusion);
-        assert_eq!(result.image.size()?, image.size()?);
+        assert_eq!(result.method, ReconstructionMethod::Diffusion);
+        assert_eq!(result.output_image.size()?, image.size()?);
         
         Ok(())
     }
