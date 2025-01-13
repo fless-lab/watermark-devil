@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::fs;
 use log::{info, error};
 use anyhow::{Result, Context};
+use image;
 
-use crate::ml::models::{
+use watermark_evil::ml::models::{
     logo_detector::LogoDetector,
     text_detector::TextDetector,
     pattern_detector::PatternDetector,
