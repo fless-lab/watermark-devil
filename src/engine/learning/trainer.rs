@@ -264,3 +264,268 @@ mod tests {
         assert!(result.is_ok(), "Model training should succeed");
     }
 }
+
+pub struct ContinuousTrainer {
+    config: TrainingConfig,
+    collector: Arc<DataCollector>,
+    state: Arc<RwLock<TrainerState>>,
+}
+
+#[derive(Debug)]
+struct TrainerState {
+    last_training: Option<DateTime<Utc>>,
+    current_metrics: ModelMetrics,
+    training_in_progress: bool,
+}
+
+impl ContinuousTrainer {
+    pub fn new(config: &TrainingConfig, collector: Arc<DataCollector>) -> Result<Self> {
+        Ok(Self {
+            config: config.clone(),
+            collector,
+            state: Arc::new(RwLock::new(TrainerState {
+                last_training: None,
+                current_metrics: ModelMetrics::default(),
+                training_in_progress: false,
+            })),
+        })
+    }
+    
+    pub async fn train_if_needed(&self) -> Result<bool> {
+        let mut state = self.state.write().await;
+        
+        if state.training_in_progress {
+            debug!("Training already in progress, skipping");
+            return Ok(false);
+        }
+        
+        // Check if we have enough new examples
+        let examples = self.collector.get_training_examples(1000).await?;
+        if examples.len() < 100 {
+            debug!("Not enough training examples ({}), skipping", examples.len());
+            return Ok(false);
+        }
+        
+        // Check if enough time has passed since last training
+        if let Some(last_training) = state.last_training {
+            let elapsed = Utc::now() - last_training;
+            if elapsed.num_hours() < 24 {
+                debug!("Not enough time since last training, skipping");
+                return Ok(false);
+            }
+        }
+        
+        // Start training
+        state.training_in_progress = true;
+        let config = self.config.clone();
+        let collector = Arc::clone(&self.collector);
+        let state = Arc::clone(&self.state);
+        
+        tokio::spawn(async move {
+            if let Err(e) = Self::train_models(config, collector, state).await {
+                warn!("Training failed: {}", e);
+            }
+        });
+        
+        Ok(true)
+    }
+    
+    async fn train_models(
+        config: TrainingConfig,
+        collector: Arc<DataCollector>,
+        state: Arc<RwLock<TrainerState>>,
+    ) -> Result<()> {
+        info!("Starting continuous training");
+        
+        // Get training examples
+        let examples = collector.get_training_examples(config.max_examples).await?;
+        
+        // Split examples by type
+        let mut logo_examples = Vec::new();
+        let mut text_examples = Vec::new();
+        let mut pattern_examples = Vec::new();
+        let mut transparent_examples = Vec::new();
+        
+        for example in examples {
+            if example.confidence < config.min_confidence {
+                continue;
+            }
+            
+            match example.watermark_type {
+                WatermarkType::Logo => logo_examples.push(example),
+                WatermarkType::Text => text_examples.push(example),
+                WatermarkType::Pattern => pattern_examples.push(example),
+                WatermarkType::Transparent => transparent_examples.push(example),
+            }
+        }
+        
+        // Train models in parallel
+        let mut handles = Vec::new();
+        
+        if !logo_examples.is_empty() {
+            handles.push(Self::train_logo_model(logo_examples));
+        }
+        if !text_examples.is_empty() {
+            handles.push(Self::train_text_model(text_examples));
+        }
+        if !pattern_examples.is_empty() {
+            handles.push(Self::train_pattern_model(pattern_examples));
+        }
+        if !transparent_examples.is_empty() {
+            handles.push(Self::train_transparent_model(transparent_examples));
+        }
+        
+        // Wait for all training to complete
+        for handle in handles {
+            handle.await??;
+        }
+        
+        // Update state
+        let mut state = state.write().await;
+        state.last_training = Some(Utc::now());
+        state.training_in_progress = false;
+        
+        info!("Continuous training completed successfully");
+        Ok(())
+    }
+    
+    async fn train_logo_model(examples: Vec<TrainingExample>) -> Result<()> {
+        debug!("Training logo model with {} examples", examples.len());
+        Python::with_gil(|py| {
+            let model = PyModule::import(py, "ml.models.logo_detector.train")?
+                .getattr("train_model")?;
+                
+            let examples_dict = examples_to_dict(py, &examples)?;
+            model.call1((examples_dict,))?;
+            
+            Ok(())
+        })
+    }
+    
+    async fn train_text_model(examples: Vec<TrainingExample>) -> Result<()> {
+        debug!("Training text model with {} examples", examples.len());
+        Python::with_gil(|py| {
+            let model = PyModule::import(py, "ml.models.text_detector.train")?
+                .getattr("train_model")?;
+                
+            let examples_dict = examples_to_dict(py, &examples)?;
+            model.call1((examples_dict,))?;
+            
+            Ok(())
+        })
+    }
+    
+    async fn train_pattern_model(examples: Vec<TrainingExample>) -> Result<()> {
+        debug!("Training pattern model with {} examples", examples.len());
+        Python::with_gil(|py| {
+            let model = PyModule::import(py, "ml.models.pattern_detector.train")?
+                .getattr("train_model")?;
+                
+            let examples_dict = examples_to_dict(py, &examples)?;
+            model.call1((examples_dict,))?;
+            
+            Ok(())
+        })
+    }
+    
+    async fn train_transparent_model(examples: Vec<TrainingExample>) -> Result<()> {
+        debug!("Training transparent model with {} examples", examples.len());
+        Python::with_gil(|py| {
+            let model = PyModule::import(py, "ml.models.transparency_detector.train")?
+                .getattr("train_model")?;
+                
+            let examples_dict = examples_to_dict(py, &examples)?;
+            model.call1((examples_dict,))?;
+            
+            Ok(())
+        })
+    }
+}
+
+fn examples_to_dict<'py>(
+    py: Python<'py>,
+    examples: &[TrainingExample],
+) -> Result<&'py PyDict> {
+    let dict = PyDict::new(py);
+    
+    let ids: Vec<_> = examples.iter().map(|e| e.id.clone()).collect();
+    let confidences: Vec<_> = examples.iter().map(|e| e.confidence).collect();
+    let successes: Vec<_> = examples.iter().map(|e| e.success).collect();
+    let psnrs: Vec<_> = examples.iter().map(|e| e.metrics.psnr).collect();
+    let ssims: Vec<_> = examples.iter().map(|e| e.metrics.ssim).collect();
+    let fids: Vec<_> = examples.iter().map(|e| e.metrics.fid.unwrap_or(0.0)).collect();
+    let processing_times: Vec<_> = examples.iter().map(|e| e.metrics.processing_time_ms).collect();
+    
+    dict.set_item("ids", ids)?;
+    dict.set_item("confidences", confidences)?;
+    dict.set_item("successes", successes)?;
+    dict.set_item("psnrs", psnrs)?;
+    dict.set_item("ssims", ssims)?;
+    dict.set_item("fids", fids)?;
+    dict.set_item("processing_times", processing_times)?;
+    
+    Ok(dict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+    
+    #[tokio::test]
+    async fn test_continuous_training() -> Result<()> {
+        let temp_dir = tempdir()?;
+        
+        let config = TrainingConfig {
+            batch_size: 32,
+            learning_rate: 0.001,
+            epochs: 100,
+            early_stopping_patience: 10,
+            min_confidence: 0.8,
+            max_examples: 1000000,
+        };
+        
+        let collector = Arc::new(DataCollector::new(&config)?);
+        let trainer = ContinuousTrainer::new(&config, Arc::clone(&collector))?;
+        
+        // Add some test examples
+        for _ in 0..150 {
+            let example = TrainingExample {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: Utc::now(),
+                watermark_type: WatermarkType::Logo,
+                confidence: 0.95,
+                success: true,
+                metrics: ExampleMetrics {
+                    psnr: 36.0,
+                    ssim: 0.96,
+                    fid: Some(15.0),
+                    processing_time_ms: 100,
+                },
+                metadata: serde_json::json!({}),
+            };
+            
+            let image = Mat::new_rows_cols_with_default(
+                100,
+                100,
+                opencv::core::CV_8UC3,
+                opencv::core::Scalar::all(255.0),
+            )?;
+            
+            collector.collect_example(&image, &example, &image, example.metrics.clone()).await?;
+        }
+        
+        // Try to trigger training
+        let training_started = trainer.train_if_needed().await?;
+        assert!(training_started, "Training should have started");
+        
+        // Wait a bit and check state
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        
+        let state = trainer.state.read().await;
+        assert!(state.last_training.is_some());
+        
+        Ok(())
+    }
+}
