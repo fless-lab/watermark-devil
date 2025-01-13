@@ -9,7 +9,9 @@ mod analyzer;
 mod config;
 mod collector;
 mod metrics;
+mod ffi;
 
+pub use ffi::watermark_evil_core;
 use database::PatternDatabase;
 use trainer::ModelTrainer;
 use analyzer::PatternAnalyzer;

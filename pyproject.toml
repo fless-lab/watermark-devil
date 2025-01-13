@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "watermark-evil"
+version = "0.1.0"
+description = "Advanced watermark detection and removal tool"
+authors = [
+    {name = "Abdou-Raouf ATARMLA", email = "achilleatarmla@gmail.com"}
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Rust",
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Graphics",
+]
+
+[tool.maturin]
+python-source = "src"
+module-name = "watermark_evil_core"
+features = ["pyo3/extension-module"]

@@ -19,6 +19,9 @@ tokio = { version = "1.32.0", features = ["full"] }
 futures = "0.3.29"
 async-trait = "0.1.74"
 
+# Python bindings
+pyo3 = { version = "0.20.0", features = ["extension-module"] }
+
 # CLI
 clap = { version = "4.4", features = ["derive"] }
 env_logger = "0.10"

@@ -4,7 +4,9 @@ import torch
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any
 import logging
+import numpy as np
 
+from watermark_evil_core import PyModelTrainer
 from ..models.logo_detector import LogoDetector
 from ..models.text_detector import TextDetector
 from ..models.pattern_detector import PatternDetector
@@ -23,7 +25,10 @@ class AdaptiveTrainer:
         self.backup_enabled = config.get('MODEL_BACKUP_ENABLED', True)
         self.backup_path = config.get('MODEL_BACKUP_PATH', 'backups/')
         
-        # Initialize detectors
+        # Initialize Rust trainer
+        self.trainer = PyModelTrainer()
+        
+        # Initialize feature extractors
         self.logo_detector = LogoDetector()
         self.text_detector = TextDetector()
         self.pattern_detector = PatternDetector()
@@ -34,6 +39,9 @@ class AdaptiveTrainer:
 
     def should_train(self, db: Session, model_type: str) -> bool:
         """Check if model should be retrained based on new data and time elapsed"""
+        if not self.trainer.should_train():
+            return False
+            
         # Get latest training metrics
         latest_metrics = (
             db.query(ModelMetrics)
@@ -65,59 +73,48 @@ class AdaptiveTrainer:
 
     def collect_training_data(
         self, db: Session, model_type: str, last_training: datetime
-    ) -> List[Dict[str, Any]]:
-        """Collect new training data from successful detections"""
+    ) -> Dict[str, Any]:
+        """Collect and prepare training data for Rust core"""
         detections = (
             db.query(WatermarkDetection)
             .join(ProcessingRequest)
             .filter(
                 WatermarkDetection.watermark_type == model_type,
                 WatermarkDetection.created_at > last_training,
-                WatermarkDetection.confidence > 0.8  # Only use high confidence detections
+                WatermarkDetection.confidence > 0.8
             )
             .all()
         )
         
-        training_data = []
+        features = []
+        labels = []
+        
         for detection in detections:
-            training_data.append({
-                'image_path': detection.request.image_path,
-                'bbox': detection.bbox,
-                'confidence': detection.confidence,
-                'text_content': detection.text_content
-            })
-        
-        return training_data
-
-    def train_model(self, model_type: str, training_data: List[Dict[str, Any]]):
-        """Train the specified model with new data"""
-        if model_type == 'logo':
-            model = self.logo_detector
-        elif model_type == 'text':
-            model = self.text_detector
-        elif model_type == 'pattern':
-            model = self.pattern_detector
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
+            # Extract features using appropriate detector
+            if model_type == 'logo':
+                feat = self.logo_detector.extract_features(detection.request.image_path)
+            elif model_type == 'text':
+                feat = self.text_detector.extract_features(detection.request.image_path)
+            else:
+                feat = self.pattern_detector.extract_features(detection.request.image_path)
             
-        # Perform training
-        metrics = model.train(training_data)
+            features.append(feat)
+            labels.append(model_type)
         
-        if self.backup_enabled:
-            self._backup_model(model, model_type)
-            
-        return metrics
+        return {
+            'features': np.array(features, dtype=np.float32).flatten().tolist(),
+            'labels': labels
+        }
 
-    def _backup_model(self, model, model_type: str):
-        """Create a backup of the model"""
-        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        backup_file = os.path.join(
-            self.backup_path,
-            f"{model_type}_model_{timestamp}.pt"
-        )
-        
-        torch.save(model.state_dict(), backup_file)
-        logger.info(f"Created backup of {model_type} model: {backup_file}")
+    def train_model(self, model_type: str, training_data: Dict[str, Any]):
+        """Train the model using Rust core"""
+        try:
+            self.trainer.train_models(training_data)
+            metrics = self.trainer.get_metrics()
+            return metrics
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+            raise
 
     def update_metrics(self, db: Session, model_type: str, metrics: Dict[str, float]):
         """Store training metrics in database"""
@@ -161,14 +158,14 @@ class AdaptiveTrainer:
                         db, model_type, last_training
                     )
                     
-                    if training_data:
+                    if training_data['features']:
                         # Train model and update metrics
                         metrics = self.train_model(model_type, training_data)
                         self.update_metrics(db, model_type, metrics)
                         
                         logger.info(
                             f"Completed training cycle for {model_type} model with "
-                            f"{len(training_data)} samples"
+                            f"{len(training_data['features'])} samples"
                         )
                     else:
                         logger.warning(
