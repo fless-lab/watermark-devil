@@ -1,90 +1,144 @@
 use std::sync::Arc;
-use image::DynamicImage;
+use opencv::{
+    core::{Mat, MatTraitConst, Size},
+    imgproc::{self, INTER_LINEAR},
+};
 use tch::{Device, Tensor, nn};
 use anyhow::Result;
+use tracing::{info, debug};
 
-use crate::detection::DetectionResult;
+use crate::types::{Detection, ReconstructionResult, ReconstructionMethod};
+use super::ReconstructionConfig;
 
-pub struct DiffusionEngine {
+pub struct DiffusionReconstructor {
     model: Arc<DiffusionModel>,
     device: Device,
-    num_steps: i64,
+    config: ReconstructionConfig,
 }
 
 struct DiffusionModel {
     unet: nn::Sequential,
     noise_scheduler: NoiseScheduler,
+    vs: nn::VarStore,
 }
 
+#[derive(Debug)]
 struct NoiseScheduler {
-    num_steps: i64,
+    num_inference_steps: i64,
     beta_start: f64,
     beta_end: f64,
+    betas: Tensor,
+    alphas: Tensor,
+    alphas_cumprod: Tensor,
 }
 
-impl DiffusionEngine {
-    pub fn new() -> Self {
-        let device = Device::cuda_if_available();
-        Self {
-            model: Arc::new(DiffusionModel::new(device)),
+impl DiffusionReconstructor {
+    pub fn new(config: &ReconstructionConfig) -> Result<Self> {
+        info!("Initializing diffusion reconstructor");
+        
+        let device = if config.use_gpu {
+            Device::cuda_if_available()
+        } else {
+            Device::Cpu
+        };
+        
+        let model = Arc::new(DiffusionModel::new(device, config)?);
+        
+        Ok(Self {
+            model,
             device,
-            num_steps: 50,
-        }
+            config: config.clone(),
+        })
     }
 
-    pub async fn reconstruct(
-        &self,
-        image: &DynamicImage,
-        detection: &DetectionResult,
-    ) -> Result<DynamicImage> {
-        // Convertir l'image en tensor
+    pub fn reconstruct(&self, image: &Mat, detection: &Detection) -> Result<ReconstructionResult> {
+        debug!("Starting diffusion-based reconstruction");
+        
+        // Preprocess image
         let tensor = self.preprocess_image(image)?;
         
-        // Créer le masque de conditionnement
+        // Create conditioning mask
         let condition_mask = self.create_condition_mask(image, detection)?;
         
-        // Générer le bruit initial
+        // Generate initial noise
         let mut x_t = self.generate_initial_noise(&tensor.size())?;
         
-        // Process de débruitage
-        for t in (0..self.num_steps).rev() {
-            x_t = self.denoise_step(x_t, condition_mask.clone(), t)?;
+        // Denoise process
+        let num_inference_steps = if self.config.quality == "high" {
+            50
+        } else {
+            20
+        };
+        
+        for t in (0..num_inference_steps).rev() {
+            debug!("Denoising step {}/{}", num_inference_steps - t, num_inference_steps);
+            x_t = self.denoise_step(x_t, &tensor, &condition_mask, t)?;
         }
         
-        // Combiner le résultat avec l'image originale
-        let result = self.combine_with_original(tensor, x_t, &condition_mask)?;
+        // Combine result with original image
+        let result = self.combine_with_original(image, &x_t, &condition_mask)?;
         
-        // Convertir en DynamicImage
-        self.postprocess_tensor(result)
+        // Calculate quality score
+        let quality_score = self.calculate_quality(image, &result, detection)?;
+        
+        Ok(ReconstructionResult {
+            image: result,
+            quality_score,
+            method_used: ReconstructionMethod::Diffusion,
+            metadata: Some(serde_json::json!({
+                "num_inference_steps": num_inference_steps,
+                "device": format!("{:?}", self.device),
+                "quality_mode": self.config.quality,
+            })),
+        })
     }
 
-    fn preprocess_image(&self, image: &DynamicImage) -> Result<Tensor> {
-        // Convertir en tensor PyTorch
-        let tensor = tch::vision::image::load_from_memory(&image.to_bytes())?;
+    fn preprocess_image(&self, image: &Mat) -> Result<Tensor> {
+        let mut resized = Mat::default();
+        imgproc::resize(
+            image,
+            &mut resized,
+            Size::new(512, 512),
+            0.0,
+            0.0,
+            INTER_LINEAR,
+        )?;
         
-        // Normaliser
-        Ok(tensor.to_device(self.device)
+        let tensor = Tensor::try_from(&resized)?
+            .to_device(self.device)
             .to_kind(tch::Kind::Float)
-            .div(255.)
-            .sub(0.5)
-            .div(0.5))
+            .div(255.);
+        
+        // Normalize to [-1, 1]
+        Ok(tensor.sub(0.5).mul(2.0))
     }
 
-    fn create_condition_mask(
-        &self,
-        image: &DynamicImage,
-        detection: &DetectionResult,
-    ) -> Result<Tensor> {
-        let (height, width) = image.dimensions();
-        let mut mask = Tensor::zeros(&[1, 1, height as i64, width as i64], (tch::Kind::Float, self.device));
+    fn create_condition_mask(&self, image: &Mat, detection: &Detection) -> Result<Tensor> {
+        let mut mask = Mat::new_rows_cols_with_default(
+            image.rows(),
+            image.cols(),
+            opencv::core::CV_8UC1,
+            opencv::core::Scalar::all(0.0),
+        )?;
         
-        // Remplir le masque basé sur la détection
-        let bbox = &detection.bbox;
-        mask.slice(2, bbox.y as i64, (bbox.y + bbox.height) as i64, 1)
-            .slice(3, bbox.x as i64, (bbox.x + bbox.width) as i64, 1)
-            .fill_(1.);
+        let rect = detection.bbox;
+        imgproc::rectangle(
+            &mut mask,
+            opencv::core::Point::new(rect.x, rect.y),
+            opencv::core::Point::new(rect.x + rect.width, rect.y + rect.height),
+            opencv::core::Scalar::all(255.0),
+            -1,
+            imgproc::LINE_8,
+            0,
+        )?;
         
-        Ok(mask)
+        // Convert to tensor
+        let tensor = Tensor::try_from(&mask)?
+            .to_device(self.device)
+            .to_kind(tch::Kind::Float)
+            .div(255.);
+        
+        Ok(tensor)
     }
 
     fn generate_initial_noise(&self, size: &[i64]) -> Result<Tensor> {
@@ -94,112 +148,236 @@ impl DiffusionEngine {
     fn denoise_step(
         &self,
         x_t: Tensor,
-        condition_mask: Tensor,
+        original: &Tensor,
+        condition_mask: &Tensor,
         timestep: i64,
     ) -> Result<Tensor> {
         let noise_level = self.model.noise_scheduler.get_noise_level(timestep);
         
-        // Prédire le bruit
+        // Predict noise
         let noise_pred = self.model.unet.forward_t(
-            &x_t,
-            Some(&condition_mask),
-            Some(timestep),
-            false
-        )?;
+            &x_t.cat(&[original.shallow_clone(), condition_mask.shallow_clone()], 1),
+            true,
+        );
         
-        // Appliquer l'étape de débruitage
-        let x_t_minus_1 = self.model.noise_scheduler.step(
-            &x_t,
-            &noise_pred,
-            timestep,
-            noise_level,
-        )?;
-        
-        Ok(x_t_minus_1)
+        // Denoise step
+        self.model.noise_scheduler.step(&x_t, &noise_pred, timestep, noise_level)
     }
 
-    fn combine_with_original(
-        &self,
-        original: Tensor,
-        generated: Tensor,
-        mask: &Tensor,
-    ) -> Result<Tensor> {
-        // Combiner l'original et le généré selon le masque
-        Ok(original * (1. - mask) + generated * mask)
+    fn combine_with_original(&self, original: &Mat, generated: &Tensor, mask: &Tensor) -> Result<Mat> {
+        let mut generated_mat = Mat::default();
+        generated.detach().to_device(Device::Cpu).try_into_mat()?.convert_to(&mut generated_mat, opencv::core::CV_8UC3, 1.0, 0.0)?;
+        
+        let mut result = original.clone();
+        generated_mat.copy_to_masked(&mut result, mask)?;
+        
+        Ok(result)
     }
 
-    fn postprocess_tensor(&self, tensor: Tensor) -> Result<DynamicImage> {
-        let tensor = tensor
-            .mul(0.5)
-            .add(0.5)
-            .mul(255.)
-            .clamp(0., 255.)
-            .to_kind(tch::Kind::Uint8);
+    fn calculate_quality(&self, original: &Mat, result: &Mat, detection: &Detection) -> Result<f32> {
+        let mut quality = 0.0;
         
-        let height = tensor.size()[2] as u32;
-        let width = tensor.size()[3] as u32;
+        // Calculate PSNR in the reconstructed region
+        let roi = Mat::roi(result, detection.bbox)?;
+        let roi_original = Mat::roi(original, detection.bbox)?;
         
-        let buffer: Vec<u8> = tensor.flatten(0, -1)
-            .to_vec()?
-            .into_iter()
-            .map(|x| x as u8)
-            .collect();
+        let mse = opencv::core::compare_mse(&roi, &roi_original)?;
+        if mse > 0.0 {
+            quality = 10.0 * (255.0 * 255.0 / mse).log10();
+        }
         
-        Ok(DynamicImage::ImageRgb8(
-            image::RgbImage::from_raw(width, height, buffer)
-                .ok_or_else(|| anyhow::anyhow!("Failed to create image from buffer"))?
-        ))
+        // Normalize to [0, 1]
+        quality = quality / 50.0; // Typical PSNR values are between 20-50
+        quality = quality.max(0.0).min(1.0);
+        
+        Ok(quality)
     }
 }
 
 impl DiffusionModel {
-    fn new(device: Device) -> Self {
-        let vs = nn::VarStore::new(device);
+    fn new(device: Device, config: &ReconstructionConfig) -> Result<Self> {
+        let mut vs = nn::VarStore::new(device);
         
-        // Créer U-Net
-        let unet = nn::seq()
+        // Create U-Net model
+        let unet = Self::create_unet(&vs.root(), 6)?; // 3 channels image + 3 channels mask
+        
+        // Load weights if available
+        if let Some(weights_path) = &config.model_path {
+            vs.load(weights_path)?;
+        }
+        
+        let noise_scheduler = NoiseScheduler::new(
+            if config.quality == "high" { 50 } else { 20 },
+            1e-4,
+            0.02,
+        )?;
+        
+        Ok(Self {
+            unet,
+            noise_scheduler,
+            vs,
+        })
+    }
+
+    fn create_unet(vs: &nn::Path, in_channels: i64) -> Result<nn::Sequential> {
+        let seq = nn::seq()
             .add(nn::conv2d(
-                &vs.root(),
-                3,
-                64,
+                vs / "conv_in",
+                in_channels,
+                128,
                 3,
                 nn::ConvConfig {
+                    stride: 1,
                     padding: 1,
                     ..Default::default()
                 },
             ))
             .add_fn(|x| x.relu())
-            // ... Ajouter plus de couches U-Net ici
+            // Encoder
+            .add(Self::down_block(vs / "down1", 128, 256))
+            .add(Self::down_block(vs / "down2", 256, 512))
+            .add(Self::down_block(vs / "down3", 512, 512))
+            // Middle
+            .add(Self::attention_block(vs / "middle", 512))
+            // Decoder
+            .add(Self::up_block(vs / "up3", 512, 512))
+            .add(Self::up_block(vs / "up2", 512, 256))
+            .add(Self::up_block(vs / "up1", 256, 128))
+            // Output
             .add(nn::conv2d(
-                &vs.root(),
-                64,
+                vs / "conv_out",
+                128,
                 3,
                 3,
                 nn::ConvConfig {
+                    stride: 1,
                     padding: 1,
                     ..Default::default()
                 },
             ));
+        
+        Ok(seq)
+    }
 
-        Self {
-            unet,
-            noise_scheduler: NoiseScheduler::new(1000, 1e-4, 0.02),
-        }
+    fn down_block(vs: nn::Path, in_channels: i64, out_channels: i64) -> nn::Sequential {
+        nn::seq()
+            .add(nn::conv2d(
+                &vs / "conv1",
+                in_channels,
+                out_channels,
+                3,
+                nn::ConvConfig {
+                    stride: 2,
+                    padding: 1,
+                    ..Default::default()
+                },
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::conv2d(
+                &vs / "conv2",
+                out_channels,
+                out_channels,
+                3,
+                nn::ConvConfig {
+                    stride: 1,
+                    padding: 1,
+                    ..Default::default()
+                },
+            ))
+            .add_fn(|x| x.relu())
+    }
+
+    fn up_block(vs: nn::Path, in_channels: i64, out_channels: i64) -> nn::Sequential {
+        nn::seq()
+            .add_fn_t(move |x, train| {
+                x.upsample_nearest2d(&[2, 2], None, None)
+            })
+            .add(nn::conv2d(
+                &vs / "conv1",
+                in_channels,
+                out_channels,
+                3,
+                nn::ConvConfig {
+                    stride: 1,
+                    padding: 1,
+                    ..Default::default()
+                },
+            ))
+            .add_fn(|x| x.relu())
+            .add(nn::conv2d(
+                &vs / "conv2",
+                out_channels,
+                out_channels,
+                3,
+                nn::ConvConfig {
+                    stride: 1,
+                    padding: 1,
+                    ..Default::default()
+                },
+            ))
+            .add_fn(|x| x.relu())
+    }
+
+    fn attention_block(vs: nn::Path, channels: i64) -> nn::Sequential {
+        nn::seq()
+            .add(nn::conv2d(
+                &vs / "query",
+                channels,
+                channels,
+                1,
+                nn::ConvConfig::default(),
+            ))
+            .add(nn::conv2d(
+                &vs / "key",
+                channels,
+                channels,
+                1,
+                nn::ConvConfig::default(),
+            ))
+            .add(nn::conv2d(
+                &vs / "value",
+                channels,
+                channels,
+                1,
+                nn::ConvConfig::default(),
+            ))
+            .add_fn(move |x| {
+                let (b, c, h, w) = x.size4().unwrap();
+                let query = x.slice(1, 0, c/3, 1).view([b, c/3, h*w]);
+                let key = x.slice(1, c/3, 2*c/3, 1).view([b, c/3, h*w]);
+                let value = x.slice(1, 2*c/3, c, 1).view([b, c/3, h*w]);
+                
+                let attention = query.bmm(&key.transpose(1, 2)) / (c as f64).sqrt();
+                let attention = attention.softmax(-1, tch::Kind::Float);
+                
+                let out = attention.bmm(&value).view([b, c/3, h, w]);
+                out
+            })
     }
 }
 
 impl NoiseScheduler {
-    fn new(num_steps: i64, beta_start: f64, beta_end: f64) -> Self {
-        Self {
-            num_steps,
+    fn new(num_inference_steps: i64, beta_start: f64, beta_end: f64) -> Result<Self> {
+        let device = Device::cuda_if_available();
+        
+        // Create noise schedule
+        let betas = Tensor::linspace(beta_start, beta_end, num_inference_steps, (tch::Kind::Float, device));
+        let alphas = Tensor::ones(&[num_inference_steps], (tch::Kind::Float, device)) - &betas;
+        let alphas_cumprod = alphas.cumprod(0, tch::Kind::Float);
+        
+        Ok(Self {
+            num_inference_steps,
             beta_start,
             beta_end,
-        }
+            betas,
+            alphas,
+            alphas_cumprod,
+        })
     }
 
     fn get_noise_level(&self, timestep: i64) -> f64 {
-        let t = timestep as f64 / self.num_steps as f64;
-        self.beta_start + t * (self.beta_end - self.beta_start)
+        let alpha_cumprod = self.alphas_cumprod.get(timestep).double_value(&[]);
+        (1.0 - alpha_cumprod).sqrt()
     }
 
     fn step(
@@ -209,46 +387,88 @@ impl NoiseScheduler {
         timestep: i64,
         noise_level: f64,
     ) -> Result<Tensor> {
-        let alpha_t = 1.0 - noise_level;
-        let sigma_t = (noise_level * (1.0 - noise_level)).sqrt();
+        let alpha = self.alphas.get(timestep).double_value(&[]);
+        let alpha_cumprod = self.alphas_cumprod.get(timestep).double_value(&[]);
+        let beta = self.betas.get(timestep).double_value(&[]);
         
-        Ok((x_t - noise_pred.mul(sigma_t)) / alpha_t.sqrt())
+        let pred_original = (x_t - noise_pred.mul(noise_level)) / (1.0 - noise_level.powi(2)).sqrt();
+        let pred_sample_direction = noise_pred.mul((beta * (1.0 - alpha_cumprod).sqrt() / (1.0 - alpha)).sqrt());
+        
+        Ok(pred_original + pred_sample_direction)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{RgbImage, Rgb};
-    use crate::detection::{BoundingBox, WatermarkType};
-
-    #[tokio::test]
-    async fn test_diffusion() {
-        let engine = DiffusionEngine::new();
+    use opencv::imgcodecs;
+    
+    #[test]
+    fn test_diffusion_reconstruction() -> Result<()> {
+        // Create test image
+        let mut image = Mat::new_rows_cols_with_default(
+            512,
+            512,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::all(255.0),
+        )?;
         
-        // Créer une image de test
-        let mut test_image = RgbImage::new(64, 64);
-        for y in 0..64 {
-            for x in 0..64 {
-                test_image.put_pixel(x, y, Rgb([200, 200, 200]));
-            }
-        }
+        // Add watermark
+        imgproc::put_text(
+            &mut image,
+            "TEST",
+            opencv::core::Point::new(200, 250),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            2.0,
+            opencv::core::Scalar::new(128.0, 128.0, 128.0, 0.0),
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
         
-        let detection = DetectionResult {
-            confidence: 0.9,
-            bbox: BoundingBox {
-                x: 20,
-                y: 20,
-                width: 24,
-                height: 24,
-            },
-            watermark_type: WatermarkType::Complex,
-            mask: None,
+        // Create detection
+        let detection = Detection {
+            watermark_type: crate::types::WatermarkType::Text,
+            confidence: crate::types::Confidence::new(0.9),
+            bbox: opencv::core::Rect::new(180, 200, 200, 100),
+            metadata: None,
         };
-
-        let image = DynamicImage::ImageRgb8(test_image);
-        let result = engine.reconstruct(&image, &detection).await;
         
-        assert!(result.is_ok(), "Diffusion reconstruction should succeed");
+        // Create reconstructor
+        let config = ReconstructionConfig {
+            method: ReconstructionMethod::Diffusion,
+            quality: "high".to_string(),
+            use_gpu: false,
+            preserve_details: true,
+            max_iterations: 1000,
+        };
+        
+        let reconstructor = DiffusionReconstructor::new(&config)?;
+        
+        // Run reconstruction
+        let result = reconstructor.reconstruct(&image, &detection)?;
+        
+        // Verify result
+        assert!(result.quality_score > 0.5);
+        assert_eq!(result.method_used, ReconstructionMethod::Diffusion);
+        assert_eq!(result.image.size()?, image.size()?);
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_noise_scheduler() -> Result<()> {
+        let scheduler = NoiseScheduler::new(50, 1e-4, 0.02)?;
+        
+        // Test noise levels
+        let start_level = scheduler.get_noise_level(0);
+        let mid_level = scheduler.get_noise_level(25);
+        let end_level = scheduler.get_noise_level(49);
+        
+        assert!(start_level < mid_level);
+        assert!(mid_level < end_level);
+        assert!(end_level <= 1.0);
+        
+        Ok(())
     }
 }
