@@ -15,7 +15,7 @@ ratelimit==2.2.1
 # Image Processing
 Pillow==10.1.0
 numpy==1.26.2
-opencv-python==4.8.1.78
+opencv-python==4.6.0.66  # Version compatible avec PaddleOCR et Ultralytics
 torch==2.1.1
 torchvision==0.16.1
 scikit-image==0.22.0
@@ -55,7 +55,7 @@ paddleocr==2.7.0.3
 transformers==4.36.2
 easyocr==1.7.1
 onnxruntime-gpu==1.16.3
-tensorrt==8.6.1
+# tensorrt==8.6.1  # Requires NVIDIA CUDA toolkit
 
 # Scientific Computing
 scipy==1.11.4

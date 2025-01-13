@@ -29,7 +29,6 @@ wheels/
 *.pth
 *.onnx
 *.pt
-models/
 
 # Development
 .env
