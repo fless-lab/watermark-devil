@@ -131,32 +131,256 @@ impl FrequencyAnalyzer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::{GrayImage, Luma};
+use ndarray::{Array2, Array3, Axis};
+use rustfft::{FftPlanner, num_complex::Complex};
+use opencv::{
+    core::{Mat, MatTraitConst},
+    imgproc::{self, INTER_LINEAR},
+};
+use crate::types::{Detection, WatermarkType, Confidence};
+use anyhow::Result;
+use tracing::{info, debug};
 
-    #[tokio::test]
-    async fn test_frequency_analysis() {
-        let analyzer = FrequencyAnalyzer::new();
+pub struct FrequencyDetector {
+    threshold: f32,
+    min_area: u32,
+    max_area: u32,
+    fft_planner: FftPlanner<f32>,
+}
+
+impl FrequencyDetector {
+    pub fn new(threshold: f32, min_area: u32, max_area: u32) -> Self {
+        Self {
+            threshold,
+            min_area,
+            max_area,
+            fft_planner: FftPlanner::new(),
+        }
+    }
+
+    pub fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
+        info!("Starting frequency-based detection");
         
-        // Créer une image de test avec un motif périodique
-        let mut test_image = GrayImage::new(128, 128);
-        for y in 0..128 {
-            for x in 0..128 {
-                let value = if (x + y) % 8 == 0 { 255 } else { 0 };
-                test_image.put_pixel(x, y, Luma([value]));
+        // Convert to grayscale and normalize
+        let mut gray = Mat::default();
+        imgproc::cvt_color(image, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
+        
+        // Convert to floating point
+        let mut float_mat = Mat::default();
+        gray.convert_to(&mut float_mat, opencv::core::CV_32F, 1.0, 0.0)?;
+        
+        // Convert to ndarray for FFT
+        let rows = float_mat.rows() as usize;
+        let cols = float_mat.cols() as usize;
+        let data: Vec<f32> = float_mat.data_typed()?;
+        let array = Array2::from_shape_vec((rows, cols), data)?;
+        
+        // Apply FFT
+        let spectrum = self.compute_fft(&array)?;
+        
+        // Analyze spectrum
+        let peaks = self.find_periodic_patterns(&spectrum)?;
+        
+        // Convert peaks to detections
+        let detections = self.peaks_to_detections(peaks, image.size()?.width, image.size()?.height)?;
+        
+        info!("Frequency detection completed: {} patterns found", detections.len());
+        Ok(detections)
+    }
+
+    fn compute_fft(&self, image: &Array2<f32>) -> Result<Array2<Complex<f32>>> {
+        debug!("Computing 2D FFT");
+        
+        let (rows, cols) = image.dim();
+        let mut complex_input: Vec<Complex<f32>> = image
+            .iter()
+            .map(|&x| Complex::new(x, 0.0))
+            .collect();
+            
+        // Create FFT
+        let fft = self.fft_planner.plan_fft_forward(cols);
+        
+        // Apply FFT to rows
+        for row in complex_input.chunks_mut(cols) {
+            fft.process(row);
+        }
+        
+        // Transpose and apply FFT to columns
+        let mut complex_array = Array2::from_shape_vec((rows, cols), complex_input)?;
+        complex_array.swap_axes(0, 1);
+        
+        for mut row in complex_array.rows_mut() {
+            let mut row_vec: Vec<_> = row.to_vec();
+            fft.process(&mut row_vec);
+            row.assign(&Array2::from_shape_vec((1, cols), row_vec)?);
+        }
+        
+        // Shift zero frequency to center
+        self.fft_shift(&mut complex_array);
+        
+        Ok(complex_array)
+    }
+
+    fn fft_shift(&self, array: &mut Array2<Complex<f32>>) {
+        let (rows, cols) = array.dim();
+        let half_rows = rows / 2;
+        let half_cols = cols / 2;
+        
+        // Shift quadrants
+        for i in 0..half_rows {
+            for j in 0..half_cols {
+                let temp = array[[i, j]];
+                array[[i, j]] = array[[i + half_rows, j + half_cols]];
+                array[[i + half_rows, j + half_cols]] = temp;
+                
+                let temp = array[[i + half_rows, j]];
+                array[[i + half_rows, j]] = array[[i, j + half_cols]];
+                array[[i, j + half_cols]] = temp;
+            }
+        }
+    }
+
+    fn find_periodic_patterns(&self, spectrum: &Array2<Complex<f32>>) -> Result<Vec<(usize, usize, f32)>> {
+        debug!("Analyzing frequency spectrum for periodic patterns");
+        
+        let magnitude = spectrum.mapv(|x| x.norm());
+        let mean = magnitude.mean().unwrap_or(0.0);
+        let std_dev = magnitude.std(0.0);
+        
+        let mut peaks = Vec::new();
+        let (rows, cols) = magnitude.dim();
+        
+        // Find local maxima
+        for i in 1..rows-1 {
+            for j in 1..cols-1 {
+                let value = magnitude[[i, j]];
+                if value > mean + self.threshold * std_dev {
+                    let is_local_max = self.is_local_maximum(&magnitude, i, j);
+                    if is_local_max {
+                        peaks.push((i, j, value));
+                    }
+                }
             }
         }
         
-        let dynamic_image = DynamicImage::ImageLuma8(test_image);
-        let results = analyzer.analyze(&dynamic_image).await;
+        // Sort by magnitude
+        peaks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
         
-        assert!(!results.is_empty(), "Should detect periodic patterns");
-        
-        // Vérifier que les résultats ont une confiance élevée
-        for result in results {
-            assert!(result.confidence > 0.5, "Should have high confidence in periodic pattern");
+        Ok(peaks)
+    }
+
+    fn is_local_maximum(&self, array: &Array2<f32>, row: usize, col: usize) -> bool {
+        let value = array[[row, col]];
+        for i in -1..=1 {
+            for j in -1..=1 {
+                if i == 0 && j == 0 {
+                    continue;
+                }
+                let r = (row as isize + i) as usize;
+                let c = (col as isize + j) as usize;
+                if array[[r, c]] >= value {
+                    return false;
+                }
+            }
         }
+        true
+    }
+
+    fn peaks_to_detections(&self, peaks: Vec<(usize, usize, f32)>, width: i32, height: i32) -> Result<Vec<Detection>> {
+        debug!("Converting frequency peaks to detections");
+        
+        let mut detections = Vec::new();
+        for (row, col, magnitude) in peaks {
+            // Convert frequency coordinates to image space
+            let period_x = width as f32 / (col as f32);
+            let period_y = height as f32 / (row as f32);
+            
+            // Calculate area
+            let area = period_x * period_y;
+            if area < self.min_area as f32 || area > self.max_area as f32 {
+                continue;
+            }
+            
+            // Create detection
+            let confidence = Confidence::new(magnitude / 100.0);
+            let bbox = opencv::core::Rect::new(0, 0, width, height);
+            
+            detections.push(Detection {
+                watermark_type: WatermarkType::Pattern,
+                confidence,
+                bbox,
+                metadata: Some(serde_json::json!({
+                    "period_x": period_x,
+                    "period_y": period_y,
+                    "magnitude": magnitude
+                })),
+            });
+        }
+        
+        Ok(detections)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencv::imgcodecs;
+    use tempfile::tempdir;
+    
+    #[test]
+    fn test_frequency_detector() -> Result<()> {
+        // Create test image with periodic pattern
+        let mut image = Mat::new_rows_cols_with_default(
+            512,
+            512,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::all(255.0)
+        )?;
+        
+        // Add periodic watermark pattern
+        for i in 0..512 {
+            for j in 0..512 {
+                if (i + j) % 32 == 0 {
+                    *image.at_2d_mut::<opencv::core::Vec3b>(i, j)? = opencv::core::Vec3b::new(200, 200, 200);
+                }
+            }
+        }
+        
+        // Create detector
+        let detector = FrequencyDetector::new(3.0, 100, 10000);
+        
+        // Run detection
+        let detections = detector.detect(&image)?;
+        
+        // Verify results
+        assert!(!detections.is_empty(), "Should detect periodic pattern");
+        assert!(detections[0].confidence.value() > 0.5, "Should have high confidence");
+        assert_eq!(detections[0].watermark_type, WatermarkType::Pattern);
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_fft_computation() -> Result<()> {
+        let detector = FrequencyDetector::new(3.0, 100, 10000);
+        
+        // Create simple test image
+        let image = Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                1.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 1.0,
+                1.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 1.0
+            ]
+        )?;
+        
+        let spectrum = detector.compute_fft(&image)?;
+        
+        // Check spectrum properties
+        assert_eq!(spectrum.dim(), (4, 4));
+        assert!(spectrum[[0, 0]].norm() > 0.0);
+        
+        Ok(())
     }
 }

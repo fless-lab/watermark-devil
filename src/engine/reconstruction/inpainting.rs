@@ -59,6 +59,9 @@ impl InpaintingEngine {
         let mut result = Mat::default();
         photo::inpaint(&img, &mask, &mut result, self.radius as f64, self.method)?;
 
+        // Post-process for better blending
+        self.post_process(&img, &mut result, &mask)?;
+
         // Convertir le résultat en DynamicImage
         self.mat_to_dynamic_image(&result)
     }
@@ -106,6 +109,36 @@ impl InpaintingEngine {
                 cv::core::Mat_AUTO_STEP,
             )?)
         }
+    }
+
+    fn post_process(&self, original: &Mat, result: &mut Mat, mask: &Mat) -> Result<()> {
+        // Blend edges for smoother transition
+        let mut edges = Mat::default();
+        imgproc::canny(mask, &mut edges, 50.0, 150.0, 3, false)?;
+        
+        let mut dilated_edges = Mat::default();
+        let kernel = imgproc::get_structuring_element(
+            imgproc::MORPH_RECT,
+            Size::new(3, 3),
+            Point::new(-1, -1),
+        )?;
+        imgproc::dilate(&edges, &mut dilated_edges, &kernel, Point::new(-1, -1), 1, 1, 1.0)?;
+        
+        // Blend original and result at edges
+        let mut blend = Mat::default();
+        opencv::core::add_weighted(
+            original,
+            0.5,
+            result,
+            0.5,
+            0.0,
+            &mut blend,
+            -1,
+        )?;
+        
+        blend.copy_to_masked(result, &dilated_edges)?;
+        
+        Ok(())
     }
 
     // Méthodes avancées d'inpainting

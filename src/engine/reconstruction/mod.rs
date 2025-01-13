@@ -12,6 +12,7 @@ pub struct ReconstructionEngine {
     inpainting_engine: Arc<inpainting::InpaintingEngine>,
     diffusion_engine: Arc<diffusion::DiffusionEngine>,
     frequency_engine: Arc<frequency::FrequencyEngine>,
+    hybrid_engine: Arc<HybridReconstructor>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,13 @@ impl ReconstructionEngine {
             inpainting_engine: Arc::new(inpainting::InpaintingEngine::new()),
             diffusion_engine: Arc::new(diffusion::DiffusionEngine::new()),
             frequency_engine: Arc::new(frequency::FrequencyEngine::new()),
+            hybrid_engine: Arc::new(HybridReconstructor::new(ReconstructionConfig {
+                method: ReconstructionMethod::Hybrid,
+                quality: "high".to_string(),
+                use_gpu: false,
+                preserve_details: true,
+                max_iterations: 1000,
+            })?),
         }
     }
 
@@ -77,6 +85,16 @@ impl ReconstructionEngine {
                         .reconstruct(&current_image, &detection)
                         .await?;
                     (result, ReconstructionMethod::Diffusion)
+                }
+                _ => {
+                    // Utiliser l'approche hybride pour les autres cas
+                    let result = self.hybrid_engine
+                        .reconstruct(&opencv::imgcodecs::imdecode(
+                            &opencv::core::Mat::zeros(0, 0, 0),
+                            opencv::imgcodecs::IMREAD_COLOR,
+                            &image.to_bytes(),
+                        )?, &detection)?;
+                    (DynamicImage::ImageRgb8(result.image), ReconstructionMethod::Hybrid)
                 }
             };
 

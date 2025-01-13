@@ -1,198 +1,255 @@
-use std::sync::Arc;
-use image::{DynamicImage, ImageBuffer, Rgb};
-use tch::{Device, Tensor, nn, vision};
+use std::path::Path;
+use tch::{
+    nn::{self, ModuleT, OptimizerConfig},
+    Device, Tensor,
+};
+use opencv::{
+    core::{Mat, MatTraitConst, Size},
+    imgproc::{self, INTER_LINEAR},
+};
 use anyhow::Result;
+use serde::{Serialize, Deserialize};
+use tracing::{info, debug, warn};
 
-use crate::detection::{DetectionResult, BoundingBox, WatermarkType};
+use crate::types::{Detection, WatermarkType, Confidence};
 
+const INPUT_SIZE: i64 = 224;  // ResNet standard input size
+const NUM_CLASSES: i64 = 3;   // Background, Text Watermark, Logo Watermark
+
+#[derive(Debug)]
 pub struct NeuralDetector {
-    model: Arc<WatermarkNet>,
+    model: nn::Sequential,
     device: Device,
-    input_size: (i64, i64),
-    confidence_threshold: f64,
+    mean: Vec<f32>,
+    std: Vec<f32>,
 }
 
-struct WatermarkNet {
-    backbone: vision::resnet::ResNet,
-    detection_head: nn::Sequential,
-    segmentation_head: nn::Sequential,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub backbone: String,
+    pub weights_path: String,
+    pub use_pretrained: bool,
+    pub fine_tune_layers: usize,
 }
 
 impl NeuralDetector {
-    pub fn new() -> Self {
-        let device = Device::cuda_if_available();
-        let model = Arc::new(WatermarkNet::new(device));
+    pub fn new(config: &ModelConfig) -> Result<Self> {
+        info!("Initializing neural detector with backbone: {}", config.backbone);
         
-        Self {
+        let device = Device::cuda_if_available();
+        debug!("Using device: {:?}", device);
+        
+        // Create model architecture
+        let mut vs = nn::VarStore::new(device);
+        let model = Self::create_model(&config.backbone, &mut vs.root())?;
+        
+        // Load weights if available
+        if Path::new(&config.weights_path).exists() {
+            info!("Loading weights from: {}", config.weights_path);
+            vs.load(&config.weights_path)?;
+        } else if config.use_pretrained {
+            warn!("Weights not found, using pretrained initialization");
+            Self::load_pretrained_weights(&mut vs, &config.backbone)?;
+        }
+        
+        Ok(Self {
             model,
             device,
-            input_size: (512, 512),
-            confidence_threshold: 0.7,
-        }
+            mean: vec![0.485, 0.456, 0.406],  // ImageNet normalization
+            std: vec![0.229, 0.224, 0.225],
+        })
     }
 
-    pub async fn detect(&self, image: &DynamicImage) -> Vec<DetectionResult> {
-        let tensor = self.preprocess_image(image);
-        if let Ok(tensor) = tensor {
-            if let Ok(detections) = self.model.forward(&tensor) {
-                return self.postprocess_detections(detections, image.dimensions());
+    pub fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
+        debug!("Running neural detection");
+        
+        // Preprocess image
+        let tensor = self.preprocess_image(image)?;
+        
+        // Run inference
+        let output = self.model.forward_t(&tensor, true);
+        let (confidence, class) = output.softmax(-1, output.kind()).max_dim(-1, false);
+        
+        // Convert to CPU and get values
+        let confidence = Vec::<f32>::from(confidence.to_device(Device::Cpu));
+        let class = Vec::<i64>::from(class.to_device(Device::Cpu));
+        
+        // Create detections
+        let mut detections = Vec::new();
+        for (idx, &class_idx) in class.iter().enumerate() {
+            if class_idx > 0 {  // Skip background class
+                let watermark_type = match class_idx {
+                    1 => WatermarkType::Text,
+                    2 => WatermarkType::Logo,
+                    _ => continue,
+                };
+                
+                detections.push(Detection {
+                    watermark_type,
+                    confidence: Confidence::new(confidence[idx]),
+                    bbox: opencv::core::Rect::new(0, 0, image.cols(), image.rows()),
+                    metadata: Some(serde_json::json!({
+                        "class_id": class_idx,
+                        "raw_confidence": confidence[idx]
+                    })),
+                });
             }
         }
-        Vec::new()
+        
+        Ok(detections)
     }
 
-    fn preprocess_image(&self, image: &DynamicImage) -> Result<Tensor> {
-        // Redimensionner l'image
-        let resized = image.resize_exact(
-            self.input_size.0 as u32,
-            self.input_size.1 as u32,
-            image::imageops::FilterType::Lanczos3,
-        );
-
-        // Convertir en tensor PyTorch
-        let tensor = vision::image::load_from_memory(&resized.to_bytes())?;
+    fn preprocess_image(&self, image: &Mat) -> Result<Tensor> {
+        // Resize
+        let mut resized = Mat::default();
+        imgproc::resize(
+            image,
+            &mut resized,
+            Size::new(INPUT_SIZE as i32, INPUT_SIZE as i32),
+            0.0,
+            0.0,
+            INTER_LINEAR,
+        )?;
         
-        // Normaliser
-        let normalized = tensor.to_device(self.device)
-            .to_kind(tch::Kind::Float)
-            .div(255.);
+        // Convert to float and normalize
+        let mut float_mat = Mat::default();
+        resized.convert_to(&mut float_mat, opencv::core::CV_32F, 1.0/255.0, 0.0)?;
         
-        // Ajouter la dimension batch
-        Ok(normalized.unsqueeze(0))
+        // Convert to tensor
+        let data: Vec<f32> = float_mat.data_typed()?;
+        let tensor = Tensor::of_slice(&data)
+            .view([1, INPUT_SIZE, INPUT_SIZE, 3])
+            .permute(&[0, 3, 1, 2]);
+        
+        // Normalize
+        let mut normalized = tensor.shallow_clone();
+        for c in 0..3 {
+            normalized.slice(1, c, c+1, 1).sub_(&self.mean[c]);
+            normalized.slice(1, c, c+1, 1).div_(&self.std[c]);
+        }
+        
+        Ok(normalized.to_device(self.device))
     }
 
-    fn postprocess_detections(&self, detections: Tensor, original_dims: (u32, u32)) -> Vec<DetectionResult> {
-        let mut results = Vec::new();
+    fn create_model(backbone: &str, vs: &nn::Path) -> Result<nn::Sequential> {
+        let backbone = match backbone.to_lowercase().as_str() {
+            "resnet18" => nn::resnet18(vs, NUM_CLASSES),
+            "resnet34" => nn::resnet34(vs, NUM_CLASSES),
+            "resnet50" => nn::resnet50(vs, NUM_CLASSES),
+            _ => anyhow::bail!("Unsupported backbone: {}", backbone),
+        };
         
-        let (original_width, original_height) = original_dims;
-        let scale_x = original_width as f32 / self.input_size.0 as f32;
-        let scale_y = original_height as f32 / self.input_size.1 as f32;
+        Ok(backbone)
+    }
 
-        // Extraire les prédictions
-        let boxes = Vec::<Vec<f32>>::from(detections.slice(1, 0, 4, 1));
-        let scores = Vec::<f32>::from(detections.slice(1, 4, 5, 1));
-        let class_ids = Vec::<i64>::from(detections.slice(1, 5, 6, 1));
+    fn load_pretrained_weights(vs: &mut nn::VarStore, backbone: &str) -> Result<()> {
+        let url = match backbone.to_lowercase().as_str() {
+            "resnet18" => "https://download.pytorch.org/models/resnet18-5c106cde.pth",
+            "resnet34" => "https://download.pytorch.org/models/resnet34-333f7ec4.pth",
+            "resnet50" => "https://download.pytorch.org/models/resnet50-19c8e357.pth",
+            _ => anyhow::bail!("No pretrained weights for backbone: {}", backbone),
+        };
+        
+        vs.load_partial(url)?;
+        Ok(())
+    }
 
-        for i in 0..boxes.len() {
-            if scores[i] < self.confidence_threshold as f32 {
-                continue;
+    pub fn train(&mut self, train_data: &[(Mat, i64)], epochs: i32, learning_rate: f64) -> Result<()> {
+        info!("Starting training for {} epochs", epochs);
+        
+        let mut opt = nn::Adam::default().build(&self.model.vs(), learning_rate)?;
+        
+        for epoch in 0..epochs {
+            let mut total_loss = 0.0;
+            let mut correct = 0;
+            let mut total = 0;
+            
+            for (image, label) in train_data {
+                // Preprocess
+                let x = self.preprocess_image(image)?;
+                let y = Tensor::of_slice(&[*label]).to_device(self.device);
+                
+                // Forward pass
+                let output = self.model.forward_t(&x, true);
+                let loss = output.cross_entropy_loss::<Tensor>(&y, None, Reduction::Mean, -100, 0.0);
+                
+                // Backward pass
+                opt.backward_step(&loss);
+                
+                // Statistics
+                total_loss += f64::from(loss);
+                let pred = output.argmax(-1, false);
+                correct += i64::from(pred.eq_tensor(&y)).sum();
+                total += y.size()[0];
             }
-
-            let bbox = &boxes[i];
-            results.push(DetectionResult {
-                confidence: scores[i],
-                bbox: BoundingBox {
-                    x: (bbox[0] * scale_x) as u32,
-                    y: (bbox[1] * scale_y) as u32,
-                    width: ((bbox[2] - bbox[0]) * scale_x) as u32,
-                    height: ((bbox[3] - bbox[1]) * scale_y) as u32,
-                },
-                watermark_type: self.class_id_to_type(class_ids[i]),
-                mask: None,
-            });
+            
+            let accuracy = (correct as f64) / (total as f64);
+            info!(
+                "Epoch {}/{}: Loss = {:.4}, Accuracy = {:.2}%",
+                epoch + 1, epochs, total_loss / total as f64, accuracy * 100.0
+            );
         }
-
-        results
-    }
-
-    fn class_id_to_type(&self, class_id: i64) -> WatermarkType {
-        match class_id {
-            0 => WatermarkType::Logo,
-            1 => WatermarkType::Text,
-            2 => WatermarkType::Pattern,
-            3 => WatermarkType::Transparent,
-            _ => WatermarkType::Complex,
-        }
-    }
-}
-
-impl WatermarkNet {
-    fn new(device: Device) -> Self {
-        let vs = nn::VarStore::new(device);
         
-        // Utiliser ResNet50 comme backbone
-        let backbone = vision::resnet::resnet50(&vs.root(), vision::resnet::ResNet50Config::default());
-        
-        // Tête de détection
-        let detection_head = nn::seq()
-            .add(nn::conv2d(
-                &vs.root(),
-                2048,
-                512,
-                3,
-                nn::ConvConfig {
-                    padding: 1,
-                    ..Default::default()
-                },
-            ))
-            .add_fn(|x| x.relu())
-            .add(nn::conv2d(
-                &vs.root(),
-                512,
-                6, // 4 pour bbox + 1 pour score + 1 pour classe
-                1,
-                nn::ConvConfig::default(),
-            ));
-
-        // Tête de segmentation
-        let segmentation_head = nn::seq()
-            .add(nn::conv2d(
-                &vs.root(),
-                2048,
-                256,
-                3,
-                nn::ConvConfig {
-                    padding: 1,
-                    ..Default::default()
-                },
-            ))
-            .add_fn(|x| x.relu())
-            .add(nn::conv2d(
-                &vs.root(),
-                256,
-                1,
-                1,
-                nn::ConvConfig::default(),
-            ))
-            .add_fn(|x| x.sigmoid());
-
-        Self {
-            backbone,
-            detection_head,
-            segmentation_head,
-        }
-    }
-
-    fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let features = self.backbone.forward(input);
-        let detections = self.detection_head.forward(&features);
-        Ok(detections.view([-1, 6])) // Reshape pour [batch_size * anchors, 6]
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{RgbImage, Rgb};
-
-    #[tokio::test]
-    async fn test_neural_detector() {
-        let detector = NeuralDetector::new();
+    use tempfile::tempdir;
+    
+    #[test]
+    fn test_neural_detector() -> Result<()> {
+        // Create test image
+        let mut image = Mat::new_rows_cols_with_default(
+            512,
+            512,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::all(255.0)
+        )?;
         
-        // Créer une image de test
-        let mut test_image = RgbImage::new(512, 512);
-        // Dessiner un "watermark" simple
-        for y in 100..200 {
-            for x in 100..300 {
-                test_image.put_pixel(x, y, Rgb([200, 200, 200]));
-            }
+        // Add text-like pattern
+        imgproc::put_text(
+            &mut image,
+            "WATERMARK",
+            opencv::core::Point::new(100, 250),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            2.0,
+            opencv::core::Scalar::new(0.0, 0.0, 0.0, 0.0),
+            3,
+            imgproc::LINE_8,
+            false,
+        )?;
+        
+        // Create detector
+        let config = ModelConfig {
+            backbone: "resnet18".to_string(),
+            weights_path: "".to_string(),
+            use_pretrained: true,
+            fine_tune_layers: 2,
+        };
+        let detector = NeuralDetector::new(&config)?;
+        
+        // Run detection
+        let detections = detector.detect(&image)?;
+        
+        // Basic validation
+        assert!(!detections.is_empty(), "Should detect watermark");
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_model_creation() -> Result<()> {
+        let vs = nn::VarStore::new(Device::Cpu);
+        
+        // Test different backbones
+        for backbone in &["resnet18", "resnet34", "resnet50"] {
+            let model = NeuralDetector::create_model(backbone, &vs.root())?;
+            assert!(model.forward_t(&Tensor::zeros(&[1, 3, INPUT_SIZE, INPUT_SIZE], (Kind::Float, Device::Cpu)), false).size() == &[1, NUM_CLASSES]);
         }
         
-        let dynamic_image = DynamicImage::ImageRgb8(test_image);
-        let results = detector.detect(&dynamic_image).await;
-        
-        // Note: Ce test pourrait échouer sans modèle pré-entraîné
-        // Il devrait être modifié pour utiliser un mock ou un modèle de test
-        assert!(!results.is_empty(), "Should detect watermark in test image");
+        Ok(())
     }
 }
