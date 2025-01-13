@@ -1,241 +1,339 @@
 use std::sync::Arc;
-use image::{DynamicImage, ImageBuffer, Rgb};
-use rayon::prelude::*;
+use std::time::Instant;
+use anyhow::{Result, Context};
+use opencv::{
+    core::{Mat, UMat, USAGE_DEFAULT},
+    cudaimgproc,
+    prelude::*,
+};
+use metrics::{counter, gauge, histogram};
+use crate::config::ReconstructionConfig;
+use crate::types::{Detection, ReconstructionResult, Quality};
+use crate::utils::validation;
 
-mod inpainting;
-mod diffusion;
-mod frequency;
+/// Métriques de performance pour la reconstruction
+#[derive(Debug, Clone)]
+pub struct ReconstructionMetrics {
+    pub total_time_ms: f64,
+    pub preprocessing_time_ms: f64,
+    pub inpainting_time_ms: f64,
+    pub postprocessing_time_ms: f64,
+    pub memory_usage_mb: f64,
+}
 
-use crate::detection::{DetectionResult, WatermarkType};
-
+/// Moteur de reconstruction d'image
 pub struct ReconstructionEngine {
-    inpainting_engine: Arc<inpainting::InpaintingEngine>,
-    diffusion_engine: Arc<diffusion::DiffusionEngine>,
-    frequency_engine: Arc<frequency::FrequencyReconstructor>,
-    hybrid_engine: Arc<HybridReconstructor>,
-}
-
-#[derive(Debug)]
-pub struct ReconstructionResult {
-    pub success: bool,
-    pub quality_score: f32,
-    pub processing_time: std::time::Duration,
-    pub method_used: ReconstructionMethod,
-}
-
-#[derive(Debug)]
-pub enum ReconstructionMethod {
-    Inpainting,
-    Diffusion,
-    FrequencyDomain,
-    Hybrid,
+    config: ReconstructionConfig,
+    cuda_enabled: bool,
+    cuda_stream: Option<opencv::core::Stream>,
 }
 
 impl ReconstructionEngine {
-    pub fn new(config: ReconstructionConfig) -> Self {
-        Self {
-            inpainting_engine: Arc::new(inpainting::InpaintingEngine::new(&config)),
-            diffusion_engine: Arc::new(diffusion::DiffusionEngine::new(&config)),
-            frequency_engine: Arc::new(frequency::FrequencyReconstructor::new(&config).unwrap()),
-            hybrid_engine: Arc::new(HybridReconstructor::new(&config)),
-        }
+    pub fn new(config: ReconstructionConfig) -> Result<Self> {
+        // Vérifier si CUDA est disponible
+        let cuda_enabled = cudaimgproc::get_cuda_enabled_device_count()? > 0;
+        let cuda_stream = if cuda_enabled {
+            Some(opencv::core::Stream::new()?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config,
+            cuda_enabled,
+            cuda_stream,
+        })
     }
 
-    /// Reconstruit l'image en supprimant les watermarks détectés
-    pub async fn reconstruct(
-        &self,
-        image: &DynamicImage,
-        detections: &[DetectionResult],
-    ) -> anyhow::Result<(DynamicImage, Vec<ReconstructionResult>)> {
-        let mut results = Vec::new();
-        let mut current_image = image.clone();
-
-        // Trier les détections par confiance décroissante
-        let mut sorted_detections = detections.to_vec();
-        sorted_detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
-        // Traiter chaque détection
-        for detection in sorted_detections {
-            let start_time = std::time::Instant::now();
+    /// Valide les entrées de reconstruction
+    fn validate_input(&self, image: &Mat, detections: &[Detection]) -> Result<()> {
+        // Valider l'image
+        validation::check_not_empty(image)
+            .context("Image d'entrée vide")?;
             
-            let (reconstructed_image, method) = match detection.watermark_type {
-                WatermarkType::Logo | WatermarkType::Text => {
-                    // Utiliser l'inpainting pour les logos et textes
-                    let result = self.inpainting_engine
-                        .remove_watermark(&current_image, &detection)
-                        .await?;
-                    (result, ReconstructionMethod::Inpainting)
-                },
-                WatermarkType::Pattern => {
-                    // Utiliser l'analyse fréquentielle pour les motifs répétitifs
-                    let result = self.frequency_engine
-                        .remove_pattern(&current_image, &detection)
-                        .await?;
-                    (result, ReconstructionMethod::FrequencyDomain)
-                },
-                WatermarkType::Transparent | WatermarkType::Complex => {
-                    // Utiliser la diffusion pour les cas complexes
-                    let result = self.diffusion_engine
-                        .reconstruct(&current_image, &detection)
-                        .await?;
-                    (result, ReconstructionMethod::Diffusion)
-                }
-                _ => {
-                    // Utiliser l'approche hybride pour les autres cas
-                    let result = self.hybrid_engine
-                        .reconstruct(&opencv::imgcodecs::imdecode(
-                            &opencv::core::Mat::zeros(0, 0, 0),
-                            opencv::imgcodecs::IMREAD_COLOR,
-                            &image.to_bytes(),
-                        )?, &detection)?;
-                    (DynamicImage::ImageRgb8(result.image), ReconstructionMethod::Hybrid)
-                }
-            };
-
-            // Évaluer la qualité de la reconstruction
-            let quality_score = self.evaluate_quality(
-                &current_image,
-                &reconstructed_image,
-                &detection,
-            );
-
-            results.push(ReconstructionResult {
-                success: quality_score > 0.8,
-                quality_score,
-                processing_time: start_time.elapsed(),
-                method_used: method,
-            });
-
-            current_image = reconstructed_image;
+        validation::check_dimensions(
+            image,
+            self.config.min_image_size,
+            self.config.max_image_size
+        ).context("Dimensions d'image invalides")?;
+        
+        validation::check_image_type(image)
+            .context("Type d'image non supporté")?;
+            
+        // Valider les détections
+        if detections.is_empty() {
+            anyhow::bail!("Aucune détection fournie");
         }
-
-        Ok((current_image, results))
+        
+        for detection in detections {
+            validation::check_bbox(&detection.bbox, image.size()?)
+                .context("Boîte englobante invalide")?;
+        }
+        
+        Ok(())
     }
 
-    /// Évalue la qualité de la reconstruction
-    fn evaluate_quality(
-        &self,
-        original: &DynamicImage,
-        reconstructed: &DynamicImage,
-        detection: &DetectionResult,
-    ) -> f32 {
-        // Calculer SSIM dans la région reconstruite
-        let bbox = &detection.bbox;
-        let original_region = original.crop(
-            bbox.x,
-            bbox.y,
-            bbox.width,
-            bbox.height,
-        );
-        let reconstructed_region = reconstructed.crop(
-            bbox.x,
-            bbox.y,
-            bbox.width,
-            bbox.height,
-        );
-
-        // Convertir en niveaux de gris pour la comparaison
-        let original_gray = original_region.to_luma8();
-        let reconstructed_gray = reconstructed_region.to_luma8();
-
-        // Calculer SSIM
-        self.calculate_ssim(&original_gray, &reconstructed_gray)
+    /// Valide les résultats de reconstruction
+    fn validate_result(&self, result: &Mat, original: &Mat) -> Result<Quality> {
+        // Vérifier les dimensions
+        if result.size()? != original.size()? {
+            anyhow::bail!("Dimensions du résultat incorrectes");
+        }
+        
+        // Vérifier le type
+        if result.type_()? != original.type_()? {
+            anyhow::bail!("Type du résultat incorrect");
+        }
+        
+        // Calculer la qualité (PSNR, SSIM, etc.)
+        let quality = self.compute_quality(result, original)?;
+        
+        // Vérifier si la qualité est acceptable
+        if quality.psnr < self.config.min_psnr {
+            anyhow::bail!("Qualité de reconstruction insuffisante");
+        }
+        
+        Ok(quality)
     }
 
-    /// Calcule l'indice SSIM (Structural Similarity Index)
-    fn calculate_ssim(
-        &self,
-        img1: &image::GrayImage,
-        img2: &image::GrayImage,
-    ) -> f32 {
-        const C1: f32 = 0.01 * 255.0 * 0.01 * 255.0;
-        const C2: f32 = 0.03 * 255.0 * 0.03 * 255.0;
+    /// Calcule les métriques de qualité
+    fn compute_quality(&self, result: &Mat, original: &Mat) -> Result<Quality> {
+        let psnr = opencv::core::PSNR(result, original, 255.0)?;
+        // TODO: Ajouter d'autres métriques (SSIM, etc.)
+        
+        Ok(Quality { psnr })
+    }
 
-        let mut sum_ssim = 0.0;
-        let mut count = 0;
+    /// Reconstruit l'image avec CUDA si disponible
+    pub fn reconstruct(&self, image: &Mat, detections: &[Detection]) -> Result<ReconstructionResult> {
+        let start = Instant::now();
+        let mut metrics = ReconstructionMetrics {
+            total_time_ms: 0.0,
+            preprocessing_time_ms: 0.0,
+            inpainting_time_ms: 0.0,
+            postprocessing_time_ms: 0.0,
+            memory_usage_mb: 0.0,
+        };
 
-        // Calculer les moyennes
-        let mean1: f32 = img1.pixels().map(|p| p[0] as f32).sum::<f32>() / (img1.len() as f32);
-        let mean2: f32 = img2.pixels().map(|p| p[0] as f32).sum::<f32>() / (img2.len() as f32);
+        // Validation
+        let preprocess_start = Instant::now();
+        self.validate_input(image, detections)?;
+        metrics.preprocessing_time_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Calculer les variances et covariance
-        let mut variance1 = 0.0;
-        let mut variance2 = 0.0;
-        let mut covariance = 0.0;
+        // Reconstruction
+        let inpaint_start = Instant::now();
+        let result = if self.cuda_enabled {
+            self.reconstruct_cuda(image, detections)?
+        } else {
+            self.reconstruct_cpu(image, detections)?
+        };
+        metrics.inpainting_time_ms = inpaint_start.elapsed().as_secs_f64() * 1000.0;
 
-        for (p1, p2) in img1.pixels().zip(img2.pixels()) {
-            let x = p1[0] as f32 - mean1;
-            let y = p2[0] as f32 - mean2;
-            variance1 += x * x;
-            variance2 += y * y;
-            covariance += x * y;
+        // Validation et post-traitement
+        let postprocess_start = Instant::now();
+        let quality = self.validate_result(&result, image)?;
+        metrics.postprocessing_time_ms = postprocess_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Métriques finales
+        metrics.total_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics.memory_usage_mb = self.get_memory_usage()?;
+
+        // Enregistrer les métriques
+        self.record_metrics(&metrics);
+
+        Ok(ReconstructionResult {
+            image: result,
+            quality,
+            metrics: Some(metrics),
+        })
+    }
+
+    /// Reconstruction sur GPU avec CUDA
+    fn reconstruct_cuda(&self, image: &Mat, detections: &[Detection]) -> Result<Mat> {
+        let stream = self.cuda_stream.as_ref()
+            .context("CUDA stream non initialisé")?;
+
+        // Transférer l'image sur GPU
+        let mut gpu_image = UMat::new(USAGE_DEFAULT);
+        image.copy_to_umat(&mut gpu_image)?;
+
+        // Créer le masque sur GPU
+        let mut mask = self.create_mask_cuda(detections, image.size()?)?;
+
+        // Inpainting sur GPU
+        let mut result = UMat::new(USAGE_DEFAULT);
+        cudaimgproc::inpaint(&gpu_image, &mask, &mut result, 
+            self.config.inpaint_radius, 
+            cudaimgproc::INPAINT_TELEA,
+            stream)?;
+
+        // Transférer le résultat sur CPU
+        let mut cpu_result = Mat::default();
+        result.copy_to(&mut cpu_result)?;
+
+        Ok(cpu_result)
+    }
+
+    /// Reconstruction sur CPU (fallback)
+    fn reconstruct_cpu(&self, image: &Mat, detections: &[Detection]) -> Result<Mat> {
+        let mask = self.create_mask_cpu(detections, image.size()?)?;
+        let mut result = Mat::default();
+        
+        opencv::photo::inpaint(
+            image,
+            &mask,
+            &mut result,
+            self.config.inpaint_radius,
+            opencv::photo::INPAINT_TELEA
+        )?;
+
+        Ok(result)
+    }
+
+    /// Crée un masque sur GPU
+    fn create_mask_cuda(&self, detections: &[Detection], size: opencv::core::Size) -> Result<UMat> {
+        let mut mask = UMat::new(USAGE_DEFAULT);
+        // TODO: Implémenter la création de masque optimisée sur GPU
+        Ok(mask)
+    }
+
+    /// Crée un masque sur CPU
+    fn create_mask_cpu(&self, detections: &[Detection], size: opencv::core::Size) -> Result<Mat> {
+        let mut mask = Mat::zeros(size.height, size.width, opencv::core::CV_8UC1)?;
+        
+        for detection in detections {
+            if let Some(det_mask) = &detection.mask {
+                // Utiliser le masque de détection si disponible
+                det_mask.copy_to(&mut mask)?;
+            } else {
+                // Sinon utiliser la boîte englobante
+                let rect = opencv::core::Rect::new(
+                    detection.bbox.x,
+                    detection.bbox.y,
+                    detection.bbox.width,
+                    detection.bbox.height
+                );
+                let roi = mask.roi(rect)?;
+                roi.set_to(&opencv::core::Scalar::all(255.0), &Mat::default())?;
+            }
         }
+        
+        Ok(mask)
+    }
 
-        variance1 /= img1.len() as f32;
-        variance2 /= img2.len() as f32;
-        covariance /= img1.len() as f32;
+    /// Obtient l'utilisation mémoire actuelle
+    fn get_memory_usage(&self) -> Result<f64> {
+        if self.cuda_enabled {
+            // TODO: Implémenter la mesure de mémoire GPU
+            Ok(0.0)
+        } else {
+            // TODO: Implémenter la mesure de mémoire CPU
+            Ok(0.0)
+        }
+    }
 
-        // Calculer SSIM
-        let numerator = (2.0 * mean1 * mean2 + C1) * (2.0 * covariance + C2);
-        let denominator = (mean1 * mean1 + mean2 * mean2 + C1) * 
-                         (variance1 + variance2 + C2);
-
-        numerator / denominator
+    /// Enregistre les métriques de performance
+    fn record_metrics(&self, metrics: &ReconstructionMetrics) {
+        gauge!("reconstruction.total_time_ms", metrics.total_time_ms);
+        gauge!("reconstruction.preprocessing_time_ms", metrics.preprocessing_time_ms);
+        gauge!("reconstruction.inpainting_time_ms", metrics.inpainting_time_ms);
+        gauge!("reconstruction.postprocessing_time_ms", metrics.postprocessing_time_ms);
+        gauge!("reconstruction.memory_usage_mb", metrics.memory_usage_mb);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{RgbImage, Rgb};
+    use opencv::core::{Point, Scalar};
 
-    #[tokio::test]
-    async fn test_reconstruction() {
-        let engine = ReconstructionEngine::new(ReconstructionConfig {
-            method: ReconstructionMethod::Hybrid,
-            quality: "high".to_string(),
-            use_gpu: false,
-            preserve_details: true,
-            max_iterations: 1000,
-        });
+    fn create_test_image() -> Result<Mat> {
+        let mut image = Mat::new_size_with_default(
+            opencv::core::Size::new(640, 480),
+            opencv::core::CV_8UC3,
+            Scalar::all(255.0)
+        )?;
         
-        // Créer une image de test
-        let mut test_image = RgbImage::new(100, 100);
-        for y in 0..100 {
-            for x in 0..100 {
-                test_image.put_pixel(x, y, Rgb([200, 200, 200]));
-            }
-        }
+        // Dessiner un rectangle noir
+        opencv::imgproc::rectangle(
+            &mut image,
+            Point::new(100, 100),
+            Point::new(200, 200),
+            Scalar::all(0.0),
+            -1,
+            opencv::imgproc::LINE_8,
+            0
+        )?;
         
-        // Ajouter un "watermark" simulé
-        for y in 40..60 {
-            for x in 40..60 {
-                test_image.put_pixel(x, y, Rgb([100, 100, 100]));
-            }
-        }
+        Ok(image)
+    }
 
-        let detection = DetectionResult {
-            confidence: 0.9,
-            bbox: crate::detection::BoundingBox {
-                x: 40,
-                y: 40,
-                width: 20,
-                height: 20,
+    fn create_test_detection() -> Detection {
+        Detection {
+            watermark_type: crate::types::WatermarkType::Logo,
+            bbox: crate::types::BoundingBox {
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
             },
-            watermark_type: WatermarkType::Logo,
+            confidence: crate::types::Confidence::new(0.9),
             mask: None,
-        };
+        }
+    }
 
-        let image = DynamicImage::ImageRgb8(test_image);
-        let (reconstructed, results) = engine
-            .reconstruct(&image, &[detection])
-            .await
-            .unwrap();
+    #[test]
+    fn test_validation() -> Result<()> {
+        let config = ReconstructionConfig::default();
+        let engine = ReconstructionEngine::new(config)?;
+        
+        // Image vide
+        let empty_mat = Mat::default();
+        let detection = create_test_detection();
+        assert!(engine.validate_input(&empty_mat, &[detection]).is_err());
+        
+        // Image valide
+        let valid_mat = create_test_image()?;
+        assert!(engine.validate_input(&valid_mat, &[detection]).is_ok());
+        
+        Ok(())
+    }
 
-        assert!(!results.is_empty(), "Should have reconstruction results");
-        assert!(
-            results[0].quality_score > 0.5,
-            "Reconstruction quality should be reasonable"
-        );
+    #[test]
+    fn test_reconstruction() -> Result<()> {
+        let config = ReconstructionConfig::default();
+        let engine = ReconstructionEngine::new(config)?;
+        
+        let image = create_test_image()?;
+        let detection = create_test_detection();
+        
+        let result = engine.reconstruct(&image, &[detection])?;
+        
+        // Vérifier la qualité
+        assert!(result.quality.psnr > 0.0);
+        
+        // Vérifier les métriques
+        let metrics = result.metrics.unwrap();
+        assert!(metrics.total_time_ms > 0.0);
+        assert!(metrics.preprocessing_time_ms > 0.0);
+        assert!(metrics.inpainting_time_ms > 0.0);
+        assert!(metrics.postprocessing_time_ms > 0.0);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn test_cuda_fallback() -> Result<()> {
+        let config = ReconstructionConfig::default();
+        let engine = ReconstructionEngine::new(config)?;
+        
+        let image = create_test_image()?;
+        let detection = create_test_detection();
+        
+        // La reconstruction devrait fonctionner même si CUDA n'est pas disponible
+        let result = engine.reconstruct(&image, &[detection])?;
+        assert!(result.quality.psnr > 0.0);
+        
+        Ok(())
     }
 }

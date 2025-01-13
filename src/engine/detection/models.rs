@@ -1,32 +1,204 @@
 use std::sync::Arc;
-use opencv::{core::{Mat, Point, Rect, Size}, imgproc};
-use pyo3::prelude::*;
+use std::time::Instant;
+use opencv::core::{Mat, UMat};
+use opencv::prelude::*;
+use anyhow::{Result, Context};
 use rayon::prelude::*;
-use anyhow::Result;
-use tracing::{info, debug, warn};
+use metrics::{counter, gauge, histogram};
 
-use crate::types::{Detection, WatermarkType, Confidence};
+use crate::types::Detection;
 use crate::config::DetectionConfig;
+use crate::utils::validation;
 
-mod bindings;
-use bindings::{LogoDetectorWrapper, TextDetectorWrapper, PatternDetectorWrapper, TransparencyDetectorWrapper};
-
-/// Interface for all watermark detectors
+/// Trait définissant l'interface commune pour tous les détecteurs
 pub trait WatermarkDetector: Send + Sync {
+    /// Détecte les filigranes dans une image
     fn detect(&self, image: &Mat) -> Result<Vec<Detection>>;
-    fn get_type(&self) -> WatermarkType;
-    fn get_name(&self) -> String;
+    
+    /// Version optimisée GPU si disponible
+    fn detect_gpu(&self, image: &UMat) -> Result<Vec<Detection>> {
+        // Par défaut, on convertit en Mat et on utilise la version CPU
+        let cpu_mat = image.get_mat()?;
+        self.detect(&cpu_mat)
+    }
+}
+
+/// Métriques de performance pour le moteur de détection
+#[derive(Debug, Clone)]
+pub struct DetectionMetrics {
+    pub total_time_ms: f64,
+    pub preprocessing_time_ms: f64,
+    pub detection_time_ms: f64,
+    pub postprocessing_time_ms: f64,
+    pub num_detections: usize,
+}
+
+/// Détecteur qui combine les résultats de plusieurs détecteurs
+#[derive(Clone)]
+pub struct EnsembleDetector {
+    detectors: Vec<Arc<dyn WatermarkDetector>>,
+    config: DetectionConfig,
+}
+
+impl EnsembleDetector {
+    pub fn new(detectors: Vec<Arc<dyn WatermarkDetector>>, config: DetectionConfig) -> Self {
+        Self { detectors, config }
+    }
+    
+    /// Valide l'image d'entrée
+    fn validate_input(&self, image: &Mat) -> Result<()> {
+        // Vérifier que l'image n'est pas vide
+        validation::check_not_empty(image)
+            .context("Image d'entrée vide")?;
+            
+        // Vérifier les dimensions
+        validation::check_dimensions(
+            image,
+            self.config.min_image_size,
+            self.config.max_image_size
+        ).context("Dimensions d'image invalides")?;
+        
+        // Vérifier le type
+        validation::check_image_type(image)
+            .context("Type d'image non supporté")?;
+            
+        Ok(())
+    }
+    
+    fn merge_detections(&self, all_detections: Vec<Vec<Detection>>) -> Vec<Detection> {
+        let mut merged = Vec::new();
+        
+        // Aplatir toutes les détections
+        for detections in all_detections {
+            merged.extend(detections);
+        }
+        
+        // Trier par confiance décroissante
+        merged.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        
+        // Non-maximum suppression
+        self.non_max_suppression(&mut merged);
+        
+        merged
+    }
+    
+    fn non_max_suppression(&self, detections: &mut Vec<Detection>) {
+        if detections.is_empty() {
+            return;
+        }
+        
+        let mut i = 0;
+        while i < detections.len() {
+            let mut j = i + 1;
+            while j < detections.len() {
+                if validation::compute_iou(&detections[i].bbox, &detections[j].bbox) > self.config.iou_threshold {
+                    detections.remove(j);
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+    
+    /// Détecte avec métriques de performance
+    pub fn detect_with_metrics(&self, image: &Mat) -> Result<(Vec<Detection>, DetectionMetrics)> {
+        let start = Instant::now();
+        
+        // Validation
+        let preprocess_start = Instant::now();
+        self.validate_input(image)?;
+        let preprocess_time = preprocess_start.elapsed();
+        
+        // Détection parallèle
+        let detect_start = Instant::now();
+        let all_detections: Vec<_> = self.detectors.par_iter()
+            .filter_map(|detector| {
+                match detector.detect(image) {
+                    Ok(detections) => Some(detections),
+                    Err(e) => {
+                        counter!("detection.errors", 1);
+                        tracing::warn!("Erreur de détection: {}", e);
+                        None
+                    }
+                }
+            })
+            .collect();
+        let detect_time = detect_start.elapsed();
+        
+        // Post-traitement
+        let postprocess_start = Instant::now();
+        let merged = self.merge_detections(all_detections);
+        let postprocess_time = postprocess_start.elapsed();
+        
+        // Métriques
+        let total_time = start.elapsed();
+        let metrics = DetectionMetrics {
+            total_time_ms: total_time.as_secs_f64() * 1000.0,
+            preprocessing_time_ms: preprocess_time.as_secs_f64() * 1000.0,
+            detection_time_ms: detect_time.as_secs_f64() * 1000.0,
+            postprocessing_time_ms: postprocess_time.as_secs_f64() * 1000.0,
+            num_detections: merged.len(),
+        };
+        
+        // Enregistrer les métriques
+        gauge!("detection.total_time_ms", metrics.total_time_ms);
+        gauge!("detection.preprocessing_time_ms", metrics.preprocessing_time_ms);
+        gauge!("detection.detection_time_ms", metrics.detection_time_ms);
+        gauge!("detection.postprocessing_time_ms", metrics.postprocessing_time_ms);
+        histogram!("detection.num_detections", metrics.num_detections as f64);
+        
+        Ok((merged, metrics))
+    }
+}
+
+impl WatermarkDetector for EnsembleDetector {
+    fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
+        let (detections, _) = self.detect_with_metrics(image)?;
+        Ok(detections)
+    }
+    
+    fn detect_gpu(&self, image: &UMat) -> Result<Vec<Detection>> {
+        // Version optimisée GPU
+        let start = Instant::now();
+        
+        // Validation
+        let cpu_mat = image.get_mat()?;
+        self.validate_input(&cpu_mat)?;
+        
+        // Détection parallèle sur GPU
+        let all_detections: Vec<_> = self.detectors.par_iter()
+            .filter_map(|detector| {
+                match detector.detect_gpu(image) {
+                    Ok(detections) => Some(detections),
+                    Err(e) => {
+                        counter!("detection.gpu.errors", 1);
+                        tracing::warn!("Erreur de détection GPU: {}", e);
+                        None
+                    }
+                }
+            })
+            .collect();
+            
+        let merged = self.merge_detections(all_detections);
+        
+        // Métriques GPU
+        let total_time = start.elapsed();
+        gauge!("detection.gpu.total_time_ms", total_time.as_secs_f64() * 1000.0);
+        
+        Ok(merged)
+    }
 }
 
 /// Logo detector using YOLOv5 via Python-Rust integration
 pub struct LogoDetector {
-    config: DetectionConfig,
+    config: crate::config::DetectionConfig,
     model: Arc<PyObject>,
     interpreter: Arc<Python<'static>>,
 }
 
 impl LogoDetector {
-    pub fn new(config: &DetectionConfig) -> Result<Self> {
+    pub fn new(config: &crate::config::DetectionConfig) -> Result<Self> {
         Python::with_gil(|py| {
             // Import the Python model
             let model = PyModule::import(py, "ml.models.logo_detector.model")?
@@ -73,7 +245,7 @@ impl WatermarkDetector for LogoDetector {
                 
                 // Ajouter la détection
                 detections.push(Detection {
-                    watermark_type: self.get_type(),
+                    watermark_type: WatermarkType::Logo,
                     bbox: rect,
                     confidence: Confidence::new(confidence),
                     mask: None,  // Le masque sera généré si nécessaire
@@ -87,25 +259,47 @@ impl WatermarkDetector for LogoDetector {
             Ok(detections)
         })
     }
-
-    fn get_type(&self) -> WatermarkType {
-        WatermarkType::Logo
-    }
-
-    fn get_name(&self) -> String {
-        "YOLOv5 Logo Detector".to_string()
+    
+    fn detect_gpu(&self, image: &UMat) -> Result<Vec<Detection>> {
+        // Version optimisée GPU
+        let start = Instant::now();
+        
+        // Validation
+        let cpu_mat = image.get_mat()?;
+        
+        // Détection parallèle sur GPU
+        let all_detections: Vec<_> = self.detectors.par_iter()
+            .filter_map(|detector| {
+                match detector.detect_gpu(image) {
+                    Ok(detections) => Some(detections),
+                    Err(e) => {
+                        counter!("detection.gpu.errors", 1);
+                        tracing::warn!("Erreur de détection GPU: {}", e);
+                        None
+                    }
+                }
+            })
+            .collect();
+            
+        let merged = self.merge_detections(all_detections);
+        
+        // Métriques GPU
+        let total_time = start.elapsed();
+        gauge!("detection.gpu.total_time_ms", total_time.as_secs_f64() * 1000.0);
+        
+        Ok(merged)
     }
 }
 
 /// Text detector using OCR and deep learning
 pub struct TextDetector {
-    config: DetectionConfig,
+    config: crate::config::DetectionConfig,
     model: Arc<PyObject>,
     interpreter: Arc<Python<'static>>,
 }
 
 impl TextDetector {
-    pub fn new(config: &DetectionConfig) -> Result<Self> {
+    pub fn new(config: &crate::config::DetectionConfig) -> Result<Self> {
         Python::with_gil(|py| {
             let model = PyModule::import(py, "ml.models.text_detector.model")?
                 .getattr("TextDetector")?
@@ -148,25 +342,17 @@ impl WatermarkDetector for TextDetector {
             Ok(results)
         })
     }
-    
-    fn get_type(&self) -> WatermarkType {
-        WatermarkType::Text
-    }
-    
-    fn get_name(&self) -> String {
-        "TextDetector".to_string()
-    }
 }
 
 /// Pattern detector for repetitive watermarks
 pub struct PatternDetector {
-    config: DetectionConfig,
+    config: crate::config::DetectionConfig,
     model: Arc<PyObject>,
     interpreter: Arc<Python<'static>>,
 }
 
 impl PatternDetector {
-    pub fn new(config: &DetectionConfig) -> Result<Self> {
+    pub fn new(config: &crate::config::DetectionConfig) -> Result<Self> {
         Python::with_gil(|py| {
             let model = PyModule::import(py, "ml.models.pattern_detector.model")?
                 .getattr("PatternDetector")?
@@ -209,25 +395,17 @@ impl WatermarkDetector for PatternDetector {
             Ok(results)
         })
     }
-    
-    fn get_type(&self) -> WatermarkType {
-        WatermarkType::Pattern
-    }
-    
-    fn get_name(&self) -> String {
-        "PatternDetector".to_string()
-    }
 }
 
 /// Transparency detector for alpha channel and semi-transparent watermarks
 pub struct TransparencyDetector {
-    config: DetectionConfig,
+    config: crate::config::DetectionConfig,
     model: Arc<PyObject>,
     interpreter: Arc<Python<'static>>,
 }
 
 impl TransparencyDetector {
-    pub fn new(config: &DetectionConfig) -> Result<Self> {
+    pub fn new(config: &crate::config::DetectionConfig) -> Result<Self> {
         Python::with_gil(|py| {
             let model = PyModule::import(py, "ml.models.transparency_detector.model")?
                 .getattr("TransparencyDetector")?
@@ -270,98 +448,100 @@ impl WatermarkDetector for TransparencyDetector {
             Ok(results)
         })
     }
-    
-    fn get_type(&self) -> WatermarkType {
-        WatermarkType::Transparent
-    }
-    
-    fn get_name(&self) -> String {
-        "TransparencyDetector".to_string()
-    }
 }
 
-/// Ensemble detector that combines results from multiple detectors
-pub struct EnsembleDetector {
-    config: DetectionConfig,
-    logo_detector: LogoDetectorWrapper,
-    text_detector: TextDetectorWrapper,
-    pattern_detector: PatternDetectorWrapper,
-    transparency_detector: TransparencyDetectorWrapper,
-}
-
-impl EnsembleDetector {
-    pub fn new(config: &DetectionConfig) -> Result<Self> {
-        Ok(Self {
-            logo_detector: LogoDetectorWrapper::new(config)?,
-            text_detector: TextDetectorWrapper::new(config)?,
-            pattern_detector: PatternDetectorWrapper::new(config)?,
-            transparency_detector: TransparencyDetectorWrapper::new(config)?,
-            config: config.clone(),
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{WatermarkType, BoundingBox, Confidence};
+    use opencv::core::Mat;
+    
+    struct MockDetector {
+        detections: Vec<Detection>,
     }
     
-    pub fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
-        let mut all_detections = Vec::new();
-        
-        // Détecter avec chaque détecteur
-        if let Ok(detections) = self.logo_detector.detect(image) {
-            all_detections.extend(detections);
+    impl MockDetector {
+        fn new(detections: Vec<Detection>) -> Self {
+            Self { detections }
         }
-        
-        if let Ok(detections) = self.text_detector.detect(image) {
-            all_detections.extend(detections);
-        }
-        
-        if let Ok(detections) = self.pattern_detector.detect(image) {
-            all_detections.extend(detections);
-        }
-        
-        if let Ok(detections) = self.transparency_detector.detect(image) {
-            all_detections.extend(detections);
-        }
-        
-        // Non-maximum suppression
-        self.non_max_suppression(&mut all_detections);
-        
-        Ok(all_detections)
     }
     
-    fn non_max_suppression(&self, detections: &mut Vec<Detection>) {
-        if detections.is_empty() {
-            return;
+    impl WatermarkDetector for MockDetector {
+        fn detect(&self, _image: &Mat) -> Result<Vec<Detection>> {
+            Ok(self.detections.clone())
         }
+    }
+    
+    #[test]
+    fn test_validation() -> Result<()> {
+        let config = DetectionConfig::default();
+        let ensemble = EnsembleDetector::new(vec![], config);
         
-        // Trier par confiance
-        detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        // Image vide
+        let empty_mat = Mat::default();
+        assert!(ensemble.validate_input(&empty_mat).is_err());
         
-        let mut i = 0;
-        while i < detections.len() {
-            let mut j = i + 1;
-            while j < detections.len() {
-                if self.iou(&detections[i].bbox, &detections[j].bbox) > self.config.iou_threshold {
-                    detections.remove(j);
-                } else {
-                    j += 1;
-                }
+        // Image valide
+        let valid_mat = Mat::ones(100, 100, opencv::core::CV_8UC3)?;
+        assert!(ensemble.validate_input(&valid_mat).is_ok());
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_ensemble_detector() -> Result<()> {
+        let config = DetectionConfig::default();
+        
+        // Créer des détections fictives
+        let mock1 = MockDetector::new(vec![
+            Detection {
+                watermark_type: WatermarkType::Logo,
+                bbox: BoundingBox {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                confidence: Confidence::new(0.8),
+                mask: None,
             }
-            i += 1;
-        }
-    }
-    
-    fn iou(&self, bbox1: &Rect, bbox2: &Rect) -> f32 {
-        let x1 = bbox1.x.max(bbox2.x);
-        let y1 = bbox1.y.max(bbox2.y);
-        let x2 = (bbox1.x + bbox1.width).min(bbox2.x + bbox2.width);
-        let y2 = (bbox1.y + bbox1.height).min(bbox2.y + bbox2.height);
+        ]);
         
-        if x2 < x1 || y2 < y1 {
-            return 0.0;
-        }
+        let mock2 = MockDetector::new(vec![
+            Detection {
+                watermark_type: WatermarkType::Text,
+                bbox: BoundingBox {
+                    x: 50,
+                    y: 50,
+                    width: 200,
+                    height: 50,
+                },
+                confidence: Confidence::new(0.9),
+                mask: None,
+            }
+        ]);
         
-        let intersection = (x2 - x1) * (y2 - y1);
-        let area1 = bbox1.width * bbox1.height;
-        let area2 = bbox2.width * bbox2.height;
+        // Créer l'ensemble
+        let ensemble = EnsembleDetector::new(
+            vec![Arc::new(mock1), Arc::new(mock2)],
+            config
+        );
         
-        intersection as f32 / (area1 + area2 - intersection) as f32
+        // Tester la détection avec métriques
+        let test_mat = Mat::ones(100, 100, opencv::core::CV_8UC3)?;
+        let (detections, metrics) = ensemble.detect_with_metrics(&test_mat)?;
+        
+        // Vérifier les résultats
+        assert_eq!(detections.len(), 2);
+        assert!(detections[0].confidence.value > detections[1].confidence.value);
+        
+        // Vérifier les métriques
+        assert!(metrics.total_time_ms > 0.0);
+        assert!(metrics.preprocessing_time_ms > 0.0);
+        assert!(metrics.detection_time_ms > 0.0);
+        assert!(metrics.postprocessing_time_ms > 0.0);
+        assert_eq!(metrics.num_detections, 2);
+        
+        Ok(())
     }
 }
