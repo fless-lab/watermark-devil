@@ -1,0 +1,149 @@
+openapi: 3.0.0
+info:
+  title: WatermarkEvil API
+  version: 1.0.0
+  description: Advanced watermark detection and removal API
+
+servers:
+  - url: http://localhost:8000
+    description: Development server
+  - url: https://api.watermark-evil.com
+    description: Production server
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+    DetectionOptions:
+      type: object
+      properties:
+        detect_multiple:
+          type: boolean
+          description: Whether to detect multiple watermarks in the image
+          default: true
+        min_confidence:
+          type: number
+          format: float
+          description: Minimum confidence threshold for detection
+          default: 0.5
+        detection_type:
+          type: string
+          enum: [logo, text, pattern, all]
+          default: all
+
+    ReconstructionOptions:
+      type: object
+      properties:
+        quality:
+          type: string
+          enum: [low, medium, high]
+          default: high
+        method:
+          type: string
+          enum: [inpainting, diffusion, frequency, hybrid]
+          default: hybrid
+        preserve_details:
+          type: boolean
+          default: true
+
+    WatermarkLocation:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [logo, text, pattern]
+        confidence:
+          type: number
+          format: float
+        bbox:
+          type: array
+          items:
+            type: integer
+          minItems: 4
+          maxItems: 4
+        text_content:
+          type: string
+          description: Only present for text watermarks
+
+paths:
+  /detect:
+    post:
+      summary: Detect watermarks in an image
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                options:
+                  $ref: '#/components/schemas/DetectionOptions'
+      responses:
+        '200':
+          description: Successful detection
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  watermarks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatermarkLocation'
+                  processing_time:
+                    type: number
+                    format: float
+
+  /remove:
+    post:
+      summary: Remove detected watermarks from an image
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                watermarks:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/WatermarkLocation'
+                options:
+                  $ref: '#/components/schemas/ReconstructionOptions'
+      responses:
+        '200':
+          description: Successful removal
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+
+  /health:
+    get:
+      summary: Check API health
+      security: []
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy]
+                  version:
+                    type: string
