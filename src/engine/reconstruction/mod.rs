@@ -11,7 +11,7 @@ use crate::detection::{DetectionResult, WatermarkType};
 pub struct ReconstructionEngine {
     inpainting_engine: Arc<inpainting::InpaintingEngine>,
     diffusion_engine: Arc<diffusion::DiffusionEngine>,
-    frequency_engine: Arc<frequency::FrequencyEngine>,
+    frequency_engine: Arc<frequency::FrequencyReconstructor>,
     hybrid_engine: Arc<HybridReconstructor>,
 }
 
@@ -32,18 +32,12 @@ pub enum ReconstructionMethod {
 }
 
 impl ReconstructionEngine {
-    pub fn new() -> Self {
+    pub fn new(config: ReconstructionConfig) -> Self {
         Self {
-            inpainting_engine: Arc::new(inpainting::InpaintingEngine::new()),
-            diffusion_engine: Arc::new(diffusion::DiffusionEngine::new()),
-            frequency_engine: Arc::new(frequency::FrequencyEngine::new()),
-            hybrid_engine: Arc::new(HybridReconstructor::new(ReconstructionConfig {
-                method: ReconstructionMethod::Hybrid,
-                quality: "high".to_string(),
-                use_gpu: false,
-                preserve_details: true,
-                max_iterations: 1000,
-            })?),
+            inpainting_engine: Arc::new(inpainting::InpaintingEngine::new(&config)),
+            diffusion_engine: Arc::new(diffusion::DiffusionEngine::new(&config)),
+            frequency_engine: Arc::new(frequency::FrequencyReconstructor::new(&config).unwrap()),
+            hybrid_engine: Arc::new(HybridReconstructor::new(&config)),
         }
     }
 
@@ -197,7 +191,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruction() {
-        let engine = ReconstructionEngine::new();
+        let engine = ReconstructionEngine::new(ReconstructionConfig {
+            method: ReconstructionMethod::Hybrid,
+            quality: "high".to_string(),
+            use_gpu: false,
+            preserve_details: true,
+            max_iterations: 1000,
+        });
         
         // Créer une image de test
         let mut test_image = RgbImage::new(100, 100);
