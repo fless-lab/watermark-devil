@@ -15,6 +15,31 @@ pub struct EngineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoConfig {
+    pub use_gpu: bool,
+    pub batch_size: usize,
+    pub temporal_window_size: usize,
+    pub quality: i32,
+    pub hardware_acceleration: bool,
+    pub streaming_mode: bool,
+    pub buffer_size: usize,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            use_gpu: true,
+            batch_size: 16,
+            temporal_window_size: 5,
+            quality: 28,
+            hardware_acceleration: true,
+            streaming_mode: false,
+            buffer_size: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
     pub gpu_enabled: bool,
     pub cuda_devices: Vec<i32>,
@@ -23,6 +48,22 @@ pub struct ProcessingConfig {
     pub default_image_size: u32,
     pub preserve_exif: bool,
     pub output_quality: u8,
+    pub video: VideoConfig,
+}
+
+impl Default for ProcessingConfig {
+    fn default() -> Self {
+        Self {
+            gpu_enabled: true,
+            cuda_devices: vec![0],
+            max_batch_size: 16,
+            processing_timeout: 300,
+            default_image_size: 1024,
+            preserve_exif: false,
+            output_quality: 95,
+            video: VideoConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +153,36 @@ impl ConfigManager {
                 .unwrap_or_else(|_| "95".to_string())
                 .parse()
                 .unwrap_or(95),
+            video: VideoConfig {
+                use_gpu: std::env::var("VIDEO_USE_GPU")
+                    .unwrap_or_else(|_| "true".to_string())
+                    .parse()
+                    .unwrap_or(true),
+                batch_size: std::env::var("VIDEO_BATCH_SIZE")
+                    .unwrap_or_else(|_| "16".to_string())
+                    .parse()
+                    .unwrap_or(16),
+                temporal_window_size: std::env::var("VIDEO_TEMPORAL_WINDOW_SIZE")
+                    .unwrap_or_else(|_| "5".to_string())
+                    .parse()
+                    .unwrap_or(5),
+                quality: std::env::var("VIDEO_QUALITY")
+                    .unwrap_or_else(|_| "28".to_string())
+                    .parse()
+                    .unwrap_or(28),
+                hardware_acceleration: std::env::var("VIDEO_HARDWARE_ACCELERATION")
+                    .unwrap_or_else(|_| "true".to_string())
+                    .parse()
+                    .unwrap_or(true),
+                streaming_mode: std::env::var("VIDEO_STREAMING_MODE")
+                    .unwrap_or_else(|_| "false".to_string())
+                    .parse()
+                    .unwrap_or(false),
+                buffer_size: std::env::var("VIDEO_BUFFER_SIZE")
+                    .unwrap_or_else(|_| "3".to_string())
+                    .parse()
+                    .unwrap_or(3),
+            },
         };
 
         let detection = DetectionConfig {

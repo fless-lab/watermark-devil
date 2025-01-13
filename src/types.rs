@@ -91,6 +91,102 @@ pub struct ProcessingResult {
     pub metadata: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoMetadata {
+    pub width: i32,
+    pub height: i32,
+    pub fps: f64,
+    pub frame_count: i64,
+    pub processed_frames: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub channels: i32,
+}
+
+impl Frame {
+    pub fn to_mat(&self) -> opencv::Result<opencv::core::Mat> {
+        use opencv::{core, prelude::*};
+        
+        let size = core::Size::new(self.width, self.height);
+        let mat_type = match self.channels {
+            1 => core::CV_8UC1,
+            3 => core::CV_8UC3,
+            4 => core::CV_8UC4,
+            _ => return Err(opencv::Error::new(
+                core::StsError,
+                "Unsupported number of channels".to_string()
+            )),
+        };
+        
+        unsafe {
+            let mut mat = core::Mat::new_rows_cols_with_data(
+                size.height,
+                size.width,
+                mat_type,
+                self.data.as_ptr() as *mut _,
+                core::Mat_AUTO_STEP,
+            )?;
+            mat.set_size(&[size.height, size.width])?;
+            Ok(mat)
+        }
+    }
+    
+    pub fn from(mat: opencv::core::Mat) -> Self {
+        let mut data = Vec::new();
+        mat.data_bytes().unwrap().iter().for_each(|&b| data.push(b));
+        
+        Self {
+            data,
+            width: mat.cols(),
+            height: mat.rows(),
+            channels: mat.channels(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameBatch {
+    frames: Vec<Frame>,
+}
+
+impl FrameBatch {
+    pub fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+        }
+    }
+    
+    pub fn from(frames: Vec<Frame>) -> Self {
+        Self { frames }
+    }
+    
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+    
+    pub fn iter(&self) -> std::slice::Iter<'_, Frame> {
+        self.frames.iter()
+    }
+}
+
+impl IntoIterator for FrameBatch {
+    type Item = Frame;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames.into_iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
