@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "watermarkevil"
+version = "0.1.0"
+description = "Advanced Watermark Removal Tool"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+torch = "^2.0.0"
+torchvision = "^0.15.0"
+numpy = "^1.24.0"
+opencv-python-headless = "^4.8.0"
+fastapi = "^0.100.0"
+uvicorn = "^0.23.0"
+python-multipart = "^0.0.6"
+pillow = "^10.0.0"
+scikit-image = "^0.21.0"
+albumentations = "^1.3.1"
+tensorboard = "^2.13.0"
+pytest = "^7.4.0"
+black = "^23.3.0"
+isort = "^5.12.0"
+mypy = "^1.4.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

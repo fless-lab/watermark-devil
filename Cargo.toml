@@ -1,0 +1,45 @@
+[package]
+name = "watermarkevil"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Advanced Watermark Removal Tool"
+
+[workspace]
+members = ["src/engine"]
+
+[dependencies]
+# Core
+tokio = { version = "1.32", features = ["full"] }
+rayon = "1.7"
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+# Image Processing
+image = "0.24"
+opencv = { version = "0.84", features = ["cuda"] }
+imageproc = "0.23"
+
+# ML & GPU
+tch = "0.13"  # PyTorch bindings
+cuda-runtime-sys = "0.3"
+metal = "0.27"  # Pour MacOS
+
+# Python Bindings
+pyo3 = { version = "0.19", features = ["extension-module"] }
+
+# Utils
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 3
