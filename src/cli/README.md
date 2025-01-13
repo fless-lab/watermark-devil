@@ -2,40 +2,54 @@
 
 Command-line interface for watermark detection.
 
-## Usage
+## Rust Implementation (Default)
+
+The main CLI implementation is in Rust for better performance and distribution.
+
+### Usage
 
 ```bash
-python -m src.cli.main image_path [--detectors DETECTORS [DETECTORS ...]] [--format FORMAT] [--output OUTPUT]
+watermark-evil [OPTIONS] <IMAGE_PATH>
 ```
 
 ### Arguments
+- `<IMAGE_PATH>`: Path to the image file to analyze
 
-- `image_path`: Path to the image file to analyze
-- `--detectors`: Which detectors to use (default: all)
-  - Choices: all, logo, text, pattern, transparency
-  - Can specify multiple detectors
-- `--format`: Output format (default: text)
-  - Choices: text, json
-- `--output`: Output file path (optional, default: print to stdout)
+### Options
+- `-d, --detectors <DETECTORS>`: Which detectors to use [default: all] [possible values: all, logo, text, pattern, transparency]
+- `-f, --format <FORMAT>`: Output format [default: text] [possible values: text, json]
+- `-o, --output <FILE>`: Output file path (optional)
 
 ### Examples
 
 1. Basic usage (all detectors):
 ```bash
-python -m src.cli.main path/to/image.jpg
+watermark-evil image.jpg
 ```
 
 2. Use specific detectors:
 ```bash
-python -m src.cli.main path/to/image.jpg --detectors logo text
+watermark-evil image.jpg -d logo -d text
 ```
 
 3. Output JSON format:
 ```bash
-python -m src.cli.main path/to/image.jpg --format json
+watermark-evil image.jpg -f json
 ```
 
 4. Save results to file:
 ```bash
-python -m src.cli.main path/to/image.jpg --output results.txt
+watermark-evil image.jpg -o results.txt
 ```
+
+## Python Implementation (Alternative)
+
+An alternative Python implementation is available in the `py` directory.
+
+### Usage
+
+```bash
+python -m src.cli.py.main [OPTIONS] IMAGE_PATH
+```
+
+See the Python implementation's README in the `py` directory for more details.
