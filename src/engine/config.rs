@@ -40,6 +40,11 @@ pub struct ReconstructionConfig {
     pub method: String,
     pub model_path: PathBuf,
     pub temp_files_path: PathBuf,
+    pub use_gpu: bool,
+    pub preserve_details: bool,
+    pub max_iterations: usize,
+    pub window_size: usize,
+    pub overlap: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +150,26 @@ impl ConfigManager {
                 std::env::var("TEMP_FILES_PATH")
                     .unwrap_or_else(|_| "temp".to_string())
             ),
+            use_gpu: std::env::var("RECONSTRUCTION_USE_GPU")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            preserve_details: std::env::var("RECONSTRUCTION_PRESERVE_DETAILS")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            max_iterations: std::env::var("RECONSTRUCTION_MAX_ITERATIONS")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .unwrap_or(100),
+            window_size: std::env::var("RECONSTRUCTION_WINDOW_SIZE")
+                .unwrap_or_else(|_| "256".to_string())
+                .parse()
+                .unwrap_or(256),
+            overlap: std::env::var("RECONSTRUCTION_OVERLAP")
+                .unwrap_or_else(|_| "128".to_string())
+                .parse()
+                .unwrap_or(128),
         };
 
         let learning = LearningConfig {
