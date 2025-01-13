@@ -2,20 +2,26 @@ use image::DynamicImage;
 use rustfft::{FftPlanner, num_complex::Complex};
 use anyhow::Result;
 use rayon::prelude::*;
+use std::sync::Arc;
+use opencv::{imgproc, core, Mat};
+use ndarray::{Array2, ArrayBase, Data, Ix2};
 
 use crate::detection::DetectionResult;
+use crate::config::ReconstructionConfig;
 
-pub struct FrequencyEngine {
-    window_size: usize,
-    overlap: usize,
+pub struct FrequencyReconstructor {
+    config: ReconstructionConfig,
+    fft_planner: Arc<FftPlanner<f32>>,
 }
 
-impl FrequencyEngine {
-    pub fn new() -> Self {
-        Self {
-            window_size: 64,
-            overlap: 32,
-        }
+impl FrequencyReconstructor {
+    pub fn new(config: &ReconstructionConfig) -> Result<Self> {
+        info!("Initializing frequency reconstructor");
+        
+        Ok(Self {
+            config: config.clone(),
+            fft_planner: Arc::new(FftPlanner::new()),
+        })
     }
 
     pub async fn remove_pattern(
@@ -23,31 +29,48 @@ impl FrequencyEngine {
         image: &DynamicImage,
         detection: &DetectionResult,
     ) -> Result<DynamicImage> {
-        // Convertir en niveaux de gris pour l'analyse fréquentielle
-        let gray = image.to_luma8();
-        let (width, height) = gray.dimensions();
-
-        // Créer les fenêtres pour l'analyse
-        let windows = self.create_windows(width, height);
-
-        // Traiter chaque fenêtre en parallèle
-        let processed_windows: Vec<_> = windows.par_iter()
-            .map(|window| {
-                self.process_window(&gray, window, detection)
-            })
-            .collect();
-
-        // Reconstruire l'image
-        self.reconstruct_image(image, &processed_windows)
+        debug!("Starting frequency-based reconstruction");
+        
+        // Convert to grayscale for FFT
+        let mut gray = Mat::default();
+        imgproc::cvt_color(&opencv_image_to_mat(image), &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
+        
+        // Extract ROI
+        let roi = Mat::roi(&gray, detection.bbox)?;
+        
+        // Convert to ndarray for FFT
+        let roi_array = self.mat_to_array(&roi)?;
+        
+        // Apply FFT
+        let mut spectrum = self.compute_fft(&roi_array)?;
+        
+        // Filter periodic patterns
+        self.filter_spectrum(&mut spectrum)?;
+        
+        // Apply inverse FFT
+        let reconstructed_array = self.compute_ifft(&spectrum)?;
+        
+        // Convert back to Mat
+        let mut reconstructed_roi = self.array_to_mat(&reconstructed_array)?;
+        
+        // Blend with original
+        let mut result = opencv_image_to_mat(image).clone();
+        let mut roi = Mat::roi_mut(&mut result, detection.bbox)?;
+        self.blend_reconstruction(&mut roi, &reconstructed_roi)?;
+        
+        // Calculate quality score
+        let quality_score = self.calculate_quality(&opencv_image_to_mat(image), &result, detection)?;
+        
+        Ok(mat_to_dynamic_image(&result))
     }
 
     fn create_windows(&self, width: u32, height: u32) -> Vec<Window> {
         let mut windows = Vec::new();
         
-        for y in (0..height).step_by(self.window_size - self.overlap) {
-            for x in (0..width).step_by(self.window_size - self.overlap) {
-                let w = (self.window_size as u32).min(width - x);
-                let h = (self.window_size as u32).min(height - y);
+        for y in (0..height).step_by(self.config.window_size - self.config.overlap) {
+            for x in (0..width).step_by(self.config.window_size - self.config.overlap) {
+                let w = (self.config.window_size as u32).min(width - x);
+                let h = (self.config.window_size as u32).min(height - y);
                 
                 windows.push(Window {
                     x,
@@ -68,7 +91,7 @@ impl FrequencyEngine {
         detection: &DetectionResult,
     ) -> ProcessedWindow {
         // Extraire les données de la fenêtre
-        let mut data = Vec::with_capacity(self.window_size * self.window_size);
+        let mut data = Vec::with_capacity(self.config.window_size * self.config.window_size);
         for y in window.y..window.y + window.height {
             for x in window.x..window.x + window.width {
                 if let Some(pixel) = image.get_pixel_checked(x, y) {
@@ -78,8 +101,7 @@ impl FrequencyEngine {
         }
 
         // Appliquer la FFT
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(data.len());
+        let fft = self.fft_planner.plan_fft_forward(data.len());
         let mut spectrum = data.clone();
         fft.process(&mut spectrum);
 
@@ -87,7 +109,7 @@ impl FrequencyEngine {
         self.remove_periodic_components(&mut spectrum);
 
         // Appliquer la FFT inverse
-        let ifft = planner.plan_fft_inverse(spectrum.len());
+        let ifft = self.fft_planner.plan_fft_inverse(spectrum.len());
         ifft.process(&mut spectrum);
 
         // Normaliser
@@ -167,6 +189,144 @@ impl FrequencyEngine {
 
         Ok(result)
     }
+
+    fn mat_to_array(&self, mat: &Mat) -> Result<Vec<Complex<f32>>> {
+        let mut array = Vec::new();
+        for y in 0..mat.rows() {
+            for x in 0..mat.cols() {
+                let pixel = mat.at_2d::<u8>(y, x).unwrap();
+                array.push(Complex::new(pixel as f32, 0.0));
+            }
+        }
+        Ok(array)
+    }
+
+    fn array_to_mat(&self, array: &[Complex<f32>]) -> Result<Mat> {
+        let rows = (array.len() as f32).sqrt() as i32;
+        let cols = rows;
+        let mut mat = Mat::zeros(rows, cols, opencv::core::CV_8UC1);
+        for y in 0..rows {
+            for x in 0..cols {
+                let idx = y * cols + x;
+                let pixel = array[idx as usize].re as u8;
+                mat.at_2d_mut::<u8>(y, x).unwrap() = pixel;
+            }
+        }
+        Ok(mat)
+    }
+
+    fn blend_reconstruction(&self, roi: &mut Mat, reconstructed_roi: &Mat) -> Result<()> {
+        // Blend the reconstructed ROI with the original ROI
+        // This is a simple implementation and may need to be adjusted based on the specific requirements
+        for y in 0..roi.rows() {
+            for x in 0..roi.cols() {
+                let original_pixel = roi.at_2d::<u8>(y, x).unwrap();
+                let reconstructed_pixel = reconstructed_roi.at_2d::<u8>(y, x).unwrap();
+                let blended_pixel = (original_pixel as f32 * 0.5 + reconstructed_pixel as f32 * 0.5) as u8;
+                roi.at_2d_mut::<u8>(y, x).unwrap() = blended_pixel;
+            }
+        }
+        Ok(())
+    }
+
+    fn calculate_quality(&self, original: &Mat, result: &Mat, detection: &DetectionResult) -> Result<f32> {
+        // Calculate the quality score based on the original and result images
+        // This is a simple implementation and may need to be adjusted based on the specific requirements
+        let mut original_array = self.mat_to_array(original)?;
+        let mut result_array = self.mat_to_array(result)?;
+        let mut quality_score = 0.0;
+        for i in 0..original_array.len() {
+            let original_pixel = original_array[i].re;
+            let result_pixel = result_array[i].re;
+            quality_score += (original_pixel - result_pixel).abs();
+        }
+        quality_score /= original_array.len() as f32;
+        Ok(quality_score)
+    }
+
+    fn filter_spectrum(&self, spectrum: &mut Array2<Complex<f32>>) -> Result<()> {
+        let rows = spectrum.shape()[0];
+        let cols = spectrum.shape()[1];
+        let threshold = self.get_filter_threshold();
+        
+        // Apply high-pass filter to remove periodic patterns
+        for i in 0..rows {
+            for j in 0..cols {
+                let freq_x = if i <= rows/2 { i } else { rows - i } as f32;
+                let freq_y = if j <= cols/2 { j } else { cols - j } as f32;
+                let freq_magnitude = (freq_x * freq_x + freq_y * freq_y).sqrt();
+                
+                if freq_magnitude < threshold {
+                    spectrum[[i, j]] = Complex::new(0.0, 0.0);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    fn get_filter_threshold(&self) -> f32 {
+        match self.config.quality.as_str() {
+            "high" => 5.0,
+            "medium" => 10.0,
+            _ => 15.0,
+        }
+    }
+
+    fn count_spectrum_peaks(&self, spectrum: &Array2<Complex<f32>>) -> usize {
+        let mut count = 0;
+        let rows = spectrum.shape()[0];
+        let cols = spectrum.shape()[1];
+        let threshold = self.get_filter_threshold();
+        
+        for i in 1..rows-1 {
+            for j in 1..cols-1 {
+                let center = spectrum[[i, j]].norm();
+                if center > threshold {
+                    let is_peak = [
+                        spectrum[[i-1, j-1]].norm(),
+                        spectrum[[i-1, j]].norm(),
+                        spectrum[[i-1, j+1]].norm(),
+                        spectrum[[i, j-1]].norm(),
+                        spectrum[[i, j+1]].norm(),
+                        spectrum[[i+1, j-1]].norm(),
+                        spectrum[[i+1, j]].norm(),
+                        spectrum[[i+1, j+1]].norm(),
+                    ].iter().all(|&n| n <= center);
+                    
+                    if is_peak {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        
+        count
+    }
+}
+
+fn opencv_image_to_mat(image: &DynamicImage) -> Mat {
+    let (width, height) = image.dimensions();
+    let mut mat = Mat::zeros(height as i32, width as i32, opencv::core::CV_8UC3);
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = image.get_pixel(x, y);
+            mat.at_2d_mut::<[u8; 3]>(y as i32, x as i32).unwrap().copy_from_slice(&pixel.0);
+        }
+    }
+    mat
+}
+
+fn mat_to_dynamic_image(mat: &Mat) -> DynamicImage {
+    let (width, height) = (mat.cols() as u32, mat.rows() as u32);
+    let mut image = DynamicImage::new_rgb8(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = mat.at_2d::<[u8; 3]>(y as i32, x as i32).unwrap();
+            image.put_pixel(x, y, image::Rgb(pixel));
+        }
+    }
+    image
 }
 
 #[derive(Clone)]
@@ -185,37 +345,105 @@ struct ProcessedWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{RgbImage, Rgb};
-    use crate::detection::{BoundingBox, WatermarkType};
+    use opencv::{core::{Mat, Point, Scalar}, imgproc};
+    use crate::types::{Detection, WatermarkType, Confidence, ReconstructionMethod};
 
-    #[tokio::test]
-    async fn test_frequency_reconstruction() {
-        let engine = FrequencyEngine::new();
+    #[test]
+    fn test_frequency_reconstruction() -> Result<()> {
+        // Create test configuration
+        let config = ReconstructionConfig {
+            quality: "high".to_string(),
+            use_gpu: false,
+            preserve_details: true,
+            max_iterations: 1000,
+        };
         
-        // Créer une image de test avec un motif périodique
-        let mut test_image = RgbImage::new(128, 128);
-        for y in 0..128 {
-            for x in 0..128 {
-                let value = if (x + y) % 8 == 0 { 255 } else { 200 };
-                test_image.put_pixel(x, y, Rgb([value, value, value]));
+        let reconstructor = FrequencyReconstructor::new(&config)?;
+        
+        // Create test image with watermark
+        let mut image = Mat::new_rows_cols_with_default(
+            512,
+            512,
+            opencv::core::CV_8UC3,
+            Scalar::all(255.0),
+        )?;
+        
+        // Add watermark text
+        imgproc::put_text(
+            &mut image,
+            "TEST",
+            Point::new(200, 250),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            2.0,
+            Scalar::new(128.0, 128.0, 128.0, 0.0),
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+        
+        // Create detection
+        let detection = Detection {
+            watermark_type: WatermarkType::Text,
+            confidence: Confidence::new(0.9),
+            bbox: opencv::core::Rect::new(180, 200, 200, 100),
+            metadata: None,
+        };
+        
+        // Run reconstruction
+        let result = reconstructor.reconstruct(&image, &detection)?;
+        
+        // Verify result
+        assert!(result.quality_score > 0.5);
+        assert_eq!(result.method_used, ReconstructionMethod::Frequency);
+        assert_eq!(result.image.size()?, image.size()?);
+        
+        // Verify metadata
+        let metadata = result.metadata.as_ref().unwrap();
+        assert!(metadata["spectrum_peaks"].as_u64().unwrap() > 0);
+        assert!(metadata["filter_threshold"].as_f64().unwrap() > 0.0);
+        
+        Ok(())
+    }
+    
+    #[test]
+    fn test_spectrum_analysis() -> Result<()> {
+        let config = ReconstructionConfig {
+            quality: "high".to_string(),
+            use_gpu: false,
+            preserve_details: true,
+            max_iterations: 1000,
+        };
+        
+        let reconstructor = FrequencyReconstructor::new(&config)?;
+        
+        // Create test pattern with periodic components
+        let mut test_array = Array2::zeros((64, 64));
+        for i in 0..64 {
+            for j in 0..64 {
+                test_array[[i, j]] = if (i + j) % 8 == 0 { 255.0 } else { 0.0 };
             }
         }
         
-        let detection = DetectionResult {
-            confidence: 0.9,
-            bbox: BoundingBox {
-                x: 32,
-                y: 32,
-                width: 64,
-                height: 64,
-            },
-            watermark_type: WatermarkType::Pattern,
-            mask: None,
-        };
-
-        let image = DynamicImage::ImageRgb8(test_image);
-        let result = engine.remove_pattern(&image, &detection).await;
+        // Convert to complex numbers
+        let mut spectrum = Array2::zeros((64, 64));
+        for i in 0..64 {
+            for j in 0..64 {
+                spectrum[[i, j]] = Complex::new(test_array[[i, j]], 0.0);
+            }
+        }
         
-        assert!(result.is_ok(), "Frequency reconstruction should succeed");
+        // Count peaks before filtering
+        let peaks_before = reconstructor.count_spectrum_peaks(&spectrum);
+        
+        // Apply filter
+        reconstructor.filter_spectrum(&mut spectrum)?;
+        
+        // Count peaks after filtering
+        let peaks_after = reconstructor.count_spectrum_peaks(&spectrum);
+        
+        // Verify that filtering reduced the number of peaks
+        assert!(peaks_after < peaks_before);
+        
+        Ok(())
     }
 }
