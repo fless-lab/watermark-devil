@@ -258,5 +258,41 @@ def test_watermark_detection():
     except Exception as e:
         print(f"Transparency detection failed: {str(e)}")
 
+def test_webp_detection():
+    """Test watermark detection on WebP images"""
+    # Create a test WebP image with watermark
+    test_image_path = Path(__file__).parent / "resources/images/test.webp"
+    
+    # Create a sample image with watermark
+    img = np.zeros((300, 400, 3), dtype=np.uint8)
+    img.fill(255)  # White background
+    
+    # Add a watermark text
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, 'TEST WATERMARK', (50, 150), font, 1, (100, 100, 100), 2)
+    
+    # Save as WebP
+    cv2.imwrite(str(test_image_path), img, [cv2.IMWRITE_WEBP_QUALITY, 100])
+    
+    # Test detection
+    try:
+        # Test text detection
+        text_detector = TextDetector()
+        processed = text_detector.preprocess(img)
+        text_results = text_detector.detect(processed)
+        
+        # Should find at least one text watermark
+        assert len(text_results) > 0, "No text watermark detected in WebP image"
+        
+        # Check first detection
+        box, conf, text = text_results[0]
+        assert conf > 0.3, f"Low confidence text detection: {conf}"
+        assert "WATERMARK" in text, f"Expected 'WATERMARK' in detected text, got: {text}"
+        
+    finally:
+        # Cleanup
+        if test_image_path.exists():
+            test_image_path.unlink()
+
 if __name__ == "__main__":
     test_watermark_detection()
