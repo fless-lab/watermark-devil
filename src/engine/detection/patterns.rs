@@ -1,200 +1,240 @@
-use image::DynamicImage;
-use opencv as cv;
-use opencv::prelude::*;
-use opencv::core::{Mat, Size, Point};
-use opencv::imgproc;
-use crate::detection::{DetectionResult, BoundingBox, WatermarkType};
+use std::sync::Arc;
+use opencv::{
+    core::{Mat, Point, Scalar, Size, CV_32F, CV_8U},
+    imgproc,
+    features2d,
+    prelude::*,
+};
+use anyhow::{Result, Context};
+use tracing::{debug, instrument};
 
+use crate::{
+    types::{Detection, WatermarkType, BoundingBox, Confidence},
+    config::DetectionConfig,
+    error::EngineError,
+};
+
+use super::models::WatermarkDetector;
+
+/// Détecteur basé sur la reconnaissance de motifs répétitifs
+#[derive(Clone)]
 pub struct PatternDetector {
-    template_size: Size,
-    correlation_threshold: f64,
+    config: Arc<DetectionConfig>,
+    orb: Arc<features2d::ORB>,
 }
 
 impl PatternDetector {
-    pub fn new() -> Self {
-        Self {
-            template_size: Size::new(8, 8),
-            correlation_threshold: 0.8,
-        }
-    }
-
-    pub async fn detect(&self, image: &DynamicImage) -> Vec<DetectionResult> {
-        let mut results = Vec::new();
+    pub fn new(config: &DetectionConfig) -> Result<Self> {
+        let orb = features2d::ORB::create(
+            500, // Nombre maximum de features
+            1.2, // Scale factor
+            8,   // Niveaux de pyramide
+            31,  // Taille du patch
+            0,   // First level
+            2,   // WTA_K
+            features2d::ORB_ScoreType::HARRIS_SCORE as i32,
+            31,  // Taille du patch
+            20,  // Fast threshold
+        )?;
         
-        // Convertir l'image en Mat OpenCV
-        let img = self.dynamic_image_to_mat(image);
-        if img.is_err() {
-            return results;
-        }
-        let img = img.unwrap();
-
-        // 1. Détection de motifs répétitifs
-        if let Some(pattern_results) = self.detect_repetitive_patterns(&img) {
-            results.extend(pattern_results);
-        }
-
-        // 2. Détection de régions semi-transparentes
-        if let Some(transparency_results) = self.detect_transparent_regions(&img) {
-            results.extend(transparency_results);
-        }
-
-        results
+        Ok(Self {
+            config: Arc::new(config.clone()),
+            orb: Arc::new(orb),
+        })
     }
-
-    fn detect_repetitive_patterns(&self, img: &Mat) -> Option<Vec<DetectionResult>> {
-        let mut results = Vec::new();
+    
+    fn extract_features(&self, image: &Mat) -> Result<(Mat, Mat)> {
+        let mut keypoints = Mat::default();
+        let mut descriptors = Mat::default();
         
-        // Convertir en niveaux de gris
-        let mut gray = Mat::default();
-        imgproc::cvt_color(img, &mut gray, imgproc::COLOR_BGR2GRAY, 0).ok()?;
-
-        // Appliquer FFT
-        let mut complex_mat = Mat::default();
-        let mut planes = vec![Mat::default(), Mat::default()];
-        gray.convert_to(&mut planes[0], cv::core::CV_32F, 1.0, 0.0).ok()?;
-        cv::core::dft(&planes[0], &mut complex_mat, cv::core::DFT_COMPLEX_OUTPUT, 0).ok()?;
-
-        // Analyser le spectre de fréquence
-        let mut magnitude = Mat::default();
-        cv::core::magnitude(&complex_mat, &Mat::default(), &mut magnitude).ok()?;
-
-        // Détecter les pics dans le spectre
-        let mut peaks = Vec::new();
-        self.find_frequency_peaks(&magnitude, &mut peaks);
-
-        // Convertir les pics en détections
-        for peak in peaks {
-            results.push(DetectionResult {
-                confidence: 0.85,
-                bbox: BoundingBox {
-                    x: peak.x as u32,
-                    y: peak.y as u32,
-                    width: self.template_size.width as u32,
-                    height: self.template_size.height as u32,
-                },
-                watermark_type: WatermarkType::Pattern,
-                mask: None,
-            });
-        }
-
-        Some(results)
-    }
-
-    fn detect_transparent_regions(&self, img: &Mat) -> Option<Vec<DetectionResult>> {
-        let mut results = Vec::new();
-        
-        // Convertir en RGBA
-        let mut rgba = Mat::default();
-        imgproc::cvt_color(img, &mut rgba, imgproc::COLOR_BGR2BGRA, 0).ok()?;
-
-        // Extraire le canal alpha
-        let mut alpha = Mat::default();
-        let mut channels = Vec::new();
-        cv::core::split(&rgba, &mut channels).ok()?;
-        alpha = channels[3].clone();
-
-        // Détecter les régions semi-transparentes
-        let mut binary = Mat::default();
-        cv::imgproc::threshold(&alpha, &mut binary, 0.0, 255.0, cv::imgproc::THRESH_BINARY_INV).ok()?;
-
-        // Trouver les contours
-        let mut contours = Vec::new();
-        let mut hierarchy = Mat::default();
-        imgproc::find_contours(
-            &binary,
-            &mut contours,
-            &mut hierarchy,
-            imgproc::RETR_EXTERNAL,
-            imgproc::CHAIN_APPROX_SIMPLE,
-            Point::new(0, 0),
-        ).ok()?;
-
-        // Convertir les contours en détections
-        for contour in contours {
-            let rect = imgproc::bounding_rect(&contour).ok()?;
-            results.push(DetectionResult {
-                confidence: 0.9,
-                bbox: BoundingBox {
-                    x: rect.x as u32,
-                    y: rect.y as u32,
-                    width: rect.width as u32,
-                    height: rect.height as u32,
-                },
-                watermark_type: WatermarkType::Transparent,
-                mask: None,
-            });
-        }
-
-        Some(results)
-    }
-
-    fn find_frequency_peaks(&self, magnitude: &Mat, peaks: &mut Vec<Point>) {
-        // Implémentation de la détection des pics de fréquence
-        // Utilise une fenêtre glissante pour trouver les maxima locaux
-        let kernel_size = 3;
-        let mut local_max = Mat::default();
-        
-        cv::imgproc::dilate(
-            magnitude,
-            &mut local_max,
+        self.orb.detect_and_compute(
+            image,
             &Mat::default(),
-            Point::new(-1, -1),
-            1,
-            cv::core::BORDER_CONSTANT,
-            cv::core::Scalar::default(),
-        ).unwrap_or(());
-
-        // Trouver les points où magnitude == local_max
-        for y in kernel_size..(magnitude.rows() - kernel_size) {
-            for x in kernel_size..(magnitude.cols() - kernel_size) {
-                let mag_val = magnitude.at_2d::<f32>(y, x).unwrap_or(&0.0);
-                let max_val = local_max.at_2d::<f32>(y, x).unwrap_or(&0.0);
+            &mut keypoints,
+            &mut descriptors,
+            false
+        )?;
+        
+        Ok((keypoints, descriptors))
+    }
+    
+    fn find_repeated_patterns(&self, keypoints: &Mat, descriptors: &Mat) -> Result<Vec<Detection>> {
+        if descriptors.empty() {
+            return Ok(vec![]);
+        }
+        
+        let mut detections = Vec::new();
+        let matcher = features2d::BFMatcher::create(features2d::NORM_HAMMING, false)?;
+        
+        // Trouver les correspondances entre les descripteurs
+        let mut matches = Mat::default();
+        matcher.match_(&descriptors, &descriptors, &mut matches, &Mat::default())?;
+        
+        // Analyser les distances entre les points correspondants
+        let mut patterns = Vec::new();
+        let rows = matches.rows();
+        
+        for i in 0..rows {
+            let m = matches.at_row::<features2d::DMatch>(i)?;
+            if m.query_idx != m.train_idx {
+                let kp1 = keypoints.at_row::<features2d::KeyPoint>(m.query_idx as i32)?;
+                let kp2 = keypoints.at_row::<features2d::KeyPoint>(m.train_idx as i32)?;
                 
-                if (mag_val - max_val).abs() < 1e-6 && *mag_val > self.correlation_threshold {
-                    peaks.push(Point::new(x, y));
+                let dx = kp2.pt.x - kp1.pt.x;
+                let dy = kp2.pt.y - kp1.pt.y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                
+                if distance > 10.0 {
+                    patterns.push((kp1.pt, kp2.pt, m.distance as f32));
                 }
             }
         }
-    }
-
-    fn dynamic_image_to_mat(&self, image: &DynamicImage) -> cv::Result<Mat> {
-        let rgb = image.to_rgb8();
-        let (width, height) = rgb.dimensions();
         
-        unsafe {
-            Mat::new_rows_cols_with_data(
-                height as i32,
-                width as i32,
-                cv::core::CV_8UC3,
-                rgb.as_ptr() as *mut _,
-                cv::core::Mat_AUTO_STEP,
-            )
+        // Regrouper les motifs similaires
+        let mut used = vec![false; patterns.len()];
+        for i in 0..patterns.len() {
+            if used[i] {
+                continue;
+            }
+            
+            let (p1, p2, dist) = patterns[i];
+            let mut similar_count = 1;
+            let mut total_confidence = 1.0 - dist / 100.0;
+            
+            for j in i + 1..patterns.len() {
+                if used[j] {
+                    continue;
+                }
+                
+                let (p3, p4, dist2) = patterns[j];
+                let dx1 = p2.x - p1.x;
+                let dy1 = p2.y - p1.y;
+                let dx2 = p4.x - p3.x;
+                let dy2 = p4.y - p3.y;
+                
+                // Vérifier si les vecteurs sont similaires
+                let dot_product = dx1 * dx2 + dy1 * dy2;
+                let norm1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+                let norm2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+                
+                if norm1 > 0.0 && norm2 > 0.0 {
+                    let angle = (dot_product / (norm1 * norm2)).acos();
+                    
+                    if angle.abs() < 0.2 { // ~11 degrés
+                        similar_count += 1;
+                        total_confidence += 1.0 - dist2 / 100.0;
+                        used[j] = true;
+                    }
+                }
+            }
+            
+            if similar_count >= 3 {
+                let confidence = total_confidence / similar_count as f32;
+                if confidence > self.config.confidence_threshold {
+                    // Créer une détection pour ce groupe de motifs
+                    detections.push(Detection {
+                        watermark_type: WatermarkType::Pattern,
+                        bbox: BoundingBox {
+                            x: p1.x as u32,
+                            y: p1.y as u32,
+                            width: (p2.x - p1.x).abs() as u32,
+                            height: (p2.y - p1.y).abs() as u32,
+                        },
+                        confidence: Confidence::new(confidence),
+                        mask: None,
+                    });
+                }
+            }
         }
+        
+        Ok(detections)
+    }
+}
+
+impl WatermarkDetector for PatternDetector {
+    #[instrument(skip(self, image))]
+    fn detect(&self, image: &Mat) -> Result<Vec<Detection>> {
+        debug!("Starting pattern-based detection");
+        
+        // Extraction des caractéristiques
+        let (keypoints, descriptors) = self.extract_features(image)
+            .context("Failed to extract features")?;
+            
+        debug!("Extracted {} keypoints", keypoints.rows());
+        
+        // Recherche des motifs répétés
+        let detections = self.find_repeated_patterns(&keypoints, &descriptors)
+            .context("Failed to find repeated patterns")?;
+            
+        debug!("Found {} pattern detections", detections.len());
+        
+        Ok(detections)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{RgbImage, Rgb};
-
-    #[tokio::test]
-    async fn test_pattern_detection() {
-        let detector = PatternDetector::new();
+    use opencv::imgcodecs;
+    
+    #[test]
+    fn test_pattern_detector_creation() -> Result<()> {
+        let config = DetectionConfig::default();
+        let detector = PatternDetector::new(&config)?;
+        Ok(())
+    }
+    
+    #[test]
+    fn test_feature_extraction() -> Result<()> {
+        let config = DetectionConfig::default();
+        let detector = PatternDetector::new(&config)?;
         
-        // Créer une image de test avec un motif répétitif
-        let mut test_image = RgbImage::new(100, 100);
-        for y in 0..100 {
-            for x in 0..100 {
-                if (x + y) % 10 == 0 {
-                    test_image.put_pixel(x, y, Rgb([255, 255, 255]));
-                }
-            }
+        let image = imgcodecs::imread(
+            "tests/resources/images/pattern_sample.png",
+            imgcodecs::IMREAD_COLOR
+        )?;
+        
+        let (keypoints, descriptors) = detector.extract_features(&image)?;
+        assert!(keypoints.rows() > 0);
+        assert!(!descriptors.empty());
+        Ok(())
+    }
+    
+    #[test]
+    fn test_pattern_detection() -> Result<()> {
+        let config = DetectionConfig::default();
+        let detector = PatternDetector::new(&config)?;
+        
+        let image = imgcodecs::imread(
+            "tests/resources/images/pattern_sample.png",
+            imgcodecs::IMREAD_COLOR
+        )?;
+        
+        let detections = detector.detect(&image)?;
+        
+        // Vérifier que nous avons trouvé des motifs
+        assert!(!detections.is_empty());
+        
+        // Vérifier les propriétés des détections
+        for detection in detections {
+            assert_eq!(detection.watermark_type, WatermarkType::Pattern);
+            assert!(detection.confidence.value >= config.confidence_threshold);
+            assert!(detection.bbox.width > 0);
+            assert!(detection.bbox.height > 0);
         }
         
-        let dynamic_image = DynamicImage::ImageRgb8(test_image);
-        let results = detector.detect(&dynamic_image).await;
+        Ok(())
+    }
+    
+    #[test]
+    fn test_empty_image() -> Result<()> {
+        let config = DetectionConfig::default();
+        let detector = PatternDetector::new(&config)?;
         
-        assert!(!results.is_empty(), "Should detect patterns in test image");
+        let empty_image = Mat::new_rows_cols(100, 100, CV_8U)?;
+        let detections = detector.detect(&empty_image)?;
+        
+        assert!(detections.is_empty());
+        Ok(())
     }
 }
