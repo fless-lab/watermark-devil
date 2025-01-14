@@ -6,9 +6,6 @@ import sys
 import subprocess
 from pathlib import Path
 import logging
-import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-from ultralytics import YOLO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,11 +26,21 @@ def install_requirements():
     logger.info("Installing requirements...")
     pip_path = "venv/Scripts/pip.exe" if sys.platform == "win32" else "venv/bin/pip"
     requirements_path = Path(__file__).parents[1] / "requirements.txt"
+    
+    # Mettre à jour pip d'abord
+    subprocess.run([pip_path, "install", "--upgrade", "pip"], check=True)
+    
+    # Installer les dépendances
     subprocess.run([pip_path, "install", "-r", str(requirements_path)], check=True)
     logger.info("Requirements installed successfully")
 
 def download_models():
     """Download required models"""
+    # Import ici après l'installation des dépendances
+    import torch
+    from transformers import AutoTokenizer, AutoModelForTokenClassification
+    from ultralytics import YOLO
+    
     logger.info("Downloading models...")
     models_dir = Path(__file__).parents[1] / "models"
     models_dir.mkdir(exist_ok=True)
@@ -96,20 +103,20 @@ def main():
         # Install requirements
         install_requirements()
 
-        # Download models
-        download_models()
+        # Create directories
+        create_required_directories()
 
         # Build Rust project
         build_rust_project()
 
-        # Create required directories
-        create_required_directories()
+        # Download models (après l'installation des dépendances)
+        download_models()
 
         logger.info("Installation completed successfully!")
-
+        
     except Exception as e:
         logger.error(f"Installation failed: {str(e)}")
-        sys.exit(1)
+        raise
 
 if __name__ == "__main__":
     main()
